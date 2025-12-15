@@ -23,7 +23,7 @@ class OCRProcessor:
         
         self.api_key = api_key
         # Gemini REST API endpoint (multimodal)
-        self.model_name = 'gemini-2.5-flash-lite'
+        self.model_name = 'gemini-3-pro-preview'
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         
         # OCR prompt for Japanese handwritten text
