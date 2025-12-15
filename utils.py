@@ -1,6 +1,11 @@
 import os
 from pathlib import Path
 
+# Supported image extensions
+SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.tif'}
+SUPPORTED_PDF_EXTENSIONS = {'.pdf'}
+SUPPORTED_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS | SUPPORTED_PDF_EXTENSIONS
+
 def validate_pdf(uploaded_file):
     """Validate if uploaded file is a valid PDF"""
     try:
@@ -24,6 +29,78 @@ def validate_pdf(uploaded_file):
         
     except Exception:
         return False
+
+def validate_image(uploaded_file):
+    """Validate if uploaded file is a valid image"""
+    try:
+        # Check file extension
+        ext = Path(uploaded_file.name).suffix.lower()
+        if ext not in SUPPORTED_IMAGE_EXTENSIONS:
+            return False
+        
+        # Check file size (max 50MB)
+        if uploaded_file.size > 50 * 1024 * 1024:
+            return False
+        
+        # Check image magic bytes
+        uploaded_file.seek(0)
+        header = uploaded_file.read(16)
+        uploaded_file.seek(0)  # Reset file pointer
+        
+        # PNG magic bytes
+        if header[:8] == b'\x89PNG\r\n\x1a\n':
+            return True
+        
+        # JPEG magic bytes
+        if header[:2] == b'\xff\xd8':
+            return True
+        
+        # GIF magic bytes
+        if header[:6] in (b'GIF87a', b'GIF89a'):
+            return True
+        
+        # WebP magic bytes
+        if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+            return True
+        
+        # BMP magic bytes
+        if header[:2] == b'BM':
+            return True
+        
+        # TIFF magic bytes (little-endian and big-endian)
+        if header[:4] in (b'II*\x00', b'MM\x00*'):
+            return True
+        
+        return False
+        
+    except Exception:
+        return False
+
+def validate_file(uploaded_file):
+    """Validate if uploaded file is a valid PDF or image"""
+    ext = Path(uploaded_file.name).suffix.lower()
+    
+    if ext in SUPPORTED_PDF_EXTENSIONS:
+        return validate_pdf(uploaded_file)
+    elif ext in SUPPORTED_IMAGE_EXTENSIONS:
+        return validate_image(uploaded_file)
+    
+    return False
+
+def get_file_type(filename):
+    """Get file type based on extension"""
+    ext = Path(filename).suffix.lower()
+    
+    if ext in SUPPORTED_PDF_EXTENSIONS:
+        return 'pdf'
+    elif ext in SUPPORTED_IMAGE_EXTENSIONS:
+        return 'image'
+    
+    return None
+
+def get_supported_extensions_list():
+    """Get list of all supported extensions for file uploader"""
+    return list(SUPPORTED_EXTENSIONS)
 
 def extract_filename(full_filename):
     """Extract filename without extension"""

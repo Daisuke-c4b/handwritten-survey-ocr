@@ -5,13 +5,13 @@ from io import BytesIO
 import base64
 from ocr_processor import OCRProcessor
 from document_generator import DocumentGenerator
-from utils import validate_pdf, extract_filename
+from utils import validate_pdf, validate_image, validate_file, get_file_type, extract_filename, get_supported_extensions_list
 
 
 def main():
     st.title("手書きアンケートOCR・文字起こしアプリ")
     st.markdown(
-        "手書きのアンケート（PDF）をアップロードして、Gemini AIで文字起こしし、Wordファイルでダウンロードできます。")
+        "手書きのアンケート（PDF・画像）をアップロードして、Gemini AIで文字起こしし、Wordファイルでダウンロードできます。")
 
     # Initialize session state
     if 'processed_files' not in st.session_state:
@@ -21,11 +21,17 @@ def main():
         st.session_state.ocr_processor = None
 
     # File upload section
-    st.header("📁 PDFファイルのアップロード")
-    uploaded_files = st.file_uploader("手書きアンケートのPDFファイルを選択してください（複数選択可能）",
-                                      type=['pdf'],
-                                      accept_multiple_files=True,
-                                      help="複数のPDFファイルを一度にアップロードできます")
+    st.header("📁 ファイルのアップロード")
+    
+    # Get supported extensions (remove the dot for streamlit)
+    supported_types = [ext.lstrip('.') for ext in get_supported_extensions_list()]
+    
+    uploaded_files = st.file_uploader(
+        "手書きアンケートのファイルを選択してください（複数選択可能）",
+        type=supported_types,
+        accept_multiple_files=True,
+        help="対応形式: PDF, PNG, JPG, JPEG, GIF, WebP, BMP, TIFF"
+    )
 
     if uploaded_files:
         st.success(f"{len(uploaded_files)}個のファイルがアップロードされました")
@@ -70,7 +76,7 @@ def main():
 
 
 def process_files(uploaded_files):
-    """Process uploaded PDF files through OCR and generate Word documents"""
+    """Process uploaded PDF/image files through OCR and generate Word documents"""
     # Ensure OCRProcessor is available (lazy init)
     ocr_processor = st.session_state.ocr_processor
     if ocr_processor is None:
@@ -94,21 +100,38 @@ def process_files(uploaded_files):
             status_text.text(
                 f"処理中: {uploaded_file.name} ({i+1}/{len(uploaded_files)})")
 
-            # Validate PDF
-            if not validate_pdf(uploaded_file):
-                st.error(f"❌ {uploaded_file.name}: 有効なPDFファイルではありません")
+            # Get file type and validate
+            file_type = get_file_type(uploaded_file.name)
+            
+            if file_type == 'pdf':
+                if not validate_pdf(uploaded_file):
+                    st.error(f"❌ {uploaded_file.name}: 有効なPDFファイルではありません")
+                    continue
+            elif file_type == 'image':
+                if not validate_image(uploaded_file):
+                    st.error(f"❌ {uploaded_file.name}: 有効な画像ファイルではありません")
+                    continue
+            else:
+                st.error(f"❌ {uploaded_file.name}: サポートされていないファイル形式です")
                 continue
 
+            # Get file extension for temp file
+            from pathlib import Path
+            file_ext = Path(uploaded_file.name).suffix.lower()
+            
             # Save uploaded file temporarily
             with tempfile.NamedTemporaryFile(delete=False,
-                                             suffix='.pdf') as tmp_file:
+                                             suffix=file_ext) as tmp_file:
                 tmp_file.write(uploaded_file.getvalue())
                 tmp_file_path = tmp_file.name
 
             try:
-                # Process OCR
+                # Process OCR based on file type
                 with st.spinner(f"Gemini AIで文字起こし中: {uploaded_file.name}"):
-                    transcription = ocr_processor.process_pdf(tmp_file_path)
+                    if file_type == 'pdf':
+                        transcription = ocr_processor.process_pdf(tmp_file_path)
+                    else:  # image
+                        transcription = ocr_processor.process_image(tmp_file_path)
 
                 if not transcription or transcription.strip() == "":
                     st.warning(f"⚠️ {uploaded_file.name}: 文字起こし結果が空です")

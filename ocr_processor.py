@@ -23,7 +23,7 @@ class OCRProcessor:
         
         self.api_key = api_key
         # Gemini REST API endpoint (multimodal)
-        self.model_name = 'gemini-3-pro-preview'
+        self.model_name = 'Gemini 2.5 Flash-Lite'
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         
         # OCR prompt for Japanese handwritten text
@@ -108,6 +108,123 @@ class OCRProcessor:
             
         except Exception as e:
             raise Exception(f"PDF処理エラー: {str(e)}")
+    
+    def process_image(self, image_path):
+        """Process image file (PNG, JPG, etc.) and extract handwritten Japanese text using Gemini AI"""
+        try:
+            # Open image file
+            image = Image.open(image_path)
+            
+            # Convert to RGB if necessary (handle RGBA, P mode, etc.)
+            if image.mode in ('RGBA', 'P', 'LA'):
+                # Create white background for transparent images
+                background = Image.new('RGB', image.size, (255, 255, 255))
+                if image.mode == 'P':
+                    image = image.convert('RGBA')
+                background.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
+                image = background
+            elif image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # Apply image enhancement for OCR
+            image = self._enhance_image_for_ocr(image)
+            image = self._apply_additional_preprocessing(image)
+            
+            # Process as single image
+            all_images = [(image, 1)]
+            
+            # Try individual processing
+            try:
+                final_text = self._process_pages_individually(all_images)
+            except Exception as e:
+                print(f"Individual processing failed, trying batch processing: {e}")
+                final_text = self._extract_text_from_all_images(all_images)
+            
+            # Post-process the text
+            final_text = self._post_process_text(final_text)
+            
+            return final_text
+            
+        except Exception as e:
+            raise Exception(f"画像処理エラー: {str(e)}")
+    
+    def process_images(self, image_paths):
+        """Process multiple image files and extract handwritten Japanese text using Gemini AI"""
+        try:
+            all_images = []
+            
+            for idx, image_path in enumerate(image_paths):
+                # Open image file
+                image = Image.open(image_path)
+                
+                # Convert to RGB if necessary
+                if image.mode in ('RGBA', 'P', 'LA'):
+                    background = Image.new('RGB', image.size, (255, 255, 255))
+                    if image.mode == 'P':
+                        image = image.convert('RGBA')
+                    background.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
+                    image = background
+                elif image.mode != 'RGB':
+                    image = image.convert('RGB')
+                
+                # Apply image enhancement for OCR
+                image = self._enhance_image_for_ocr(image)
+                image = self._apply_additional_preprocessing(image)
+                
+                all_images.append((image, idx + 1))
+            
+            # Try individual processing first, fallback to batch if needed
+            try:
+                final_text = self._process_pages_individually(all_images)
+            except Exception as e:
+                print(f"Individual processing failed, trying batch processing: {e}")
+                final_text = self._extract_text_from_all_images(all_images)
+            
+            # Post-process the text
+            final_text = self._post_process_text(final_text)
+            
+            return final_text
+            
+        except Exception as e:
+            raise Exception(f"画像処理エラー: {str(e)}")
+    
+    def process_image_bytes(self, image_bytes, filename="image"):
+        """Process image from bytes data"""
+        try:
+            # Open image from bytes
+            image = Image.open(io.BytesIO(image_bytes))
+            
+            # Convert to RGB if necessary
+            if image.mode in ('RGBA', 'P', 'LA'):
+                background = Image.new('RGB', image.size, (255, 255, 255))
+                if image.mode == 'P':
+                    image = image.convert('RGBA')
+                background.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
+                image = background
+            elif image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # Apply image enhancement for OCR
+            image = self._enhance_image_for_ocr(image)
+            image = self._apply_additional_preprocessing(image)
+            
+            # Process as single image
+            all_images = [(image, 1)]
+            
+            # Try individual processing
+            try:
+                final_text = self._process_pages_individually(all_images)
+            except Exception as e:
+                print(f"Individual processing failed, trying batch processing: {e}")
+                final_text = self._extract_text_from_all_images(all_images)
+            
+            # Post-process the text
+            final_text = self._post_process_text(final_text)
+            
+            return final_text
+            
+        except Exception as e:
+            raise Exception(f"画像処理エラー: {str(e)}")
     
     def _enhance_image_for_ocr(self, image):
         """Enhance image quality for better OCR accuracy"""
