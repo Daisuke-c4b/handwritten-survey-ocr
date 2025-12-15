@@ -23,7 +23,7 @@ class OCRProcessor:
         
         self.api_key = api_key
         # Gemini REST API endpoint (multimodal)
-        self.model_name = 'Gemini 2.5 Flash-Lite'
+        self.model_name = 'gemini-2.5-flash-lite'
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         
         # OCR prompt for Japanese handwritten text
@@ -288,60 +288,176 @@ class OCRProcessor:
             # Return original image if preprocessing fails
             return image
     
-    def _extract_text_from_image(self, image, page_num):
-        """Extract text from image using Gemini AI"""
+    def _resize_image(self, image, scale_factor):
+        """Resize image by scale factor while maintaining aspect ratio"""
         try:
-            # Convert PIL Image to bytes
-            img_byte_arr = io.BytesIO()
-            image.save(img_byte_arr, format='PNG')
-            img_byte_arr = img_byte_arr.getvalue()
-            
-            # Create Gemini compatible image
-            gemini_image = {
-                "mime_type": "image/png",
-                "data": img_byte_arr
-            }
-            
-            # Generate content with Gemini
-            headers = {
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": self.ocr_prompt},
-                            {
-                                "inline_data": {
-                                    "mime_type": "image/png",
-                                    "data": base64.b64encode(img_byte_arr).decode("utf-8")
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-            res = requests.post(
-                f"{self.endpoint}?key={self.api_key}",
-                headers=headers,
-                json=payload,
-                timeout=120
-            )
-            res.raise_for_status()
-            data = res.json()
-            text = (
-                data.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "")
-            )
-            if text:
-                return text.strip()
-            else:
-                return f"ページ {page_num}: テキストが検出されませんでした"
-                
+            original_size = image.size
+            new_size = (int(original_size[0] * scale_factor), int(original_size[1] * scale_factor))
+            # Use LANCZOS resampling for better quality
+            resized_image = image.resize(new_size, Image.Resampling.LANCZOS)
+            print(f"画像リサイズ: {original_size} -> {new_size}")
+            return resized_image
         except Exception as e:
-            return f"ページ {page_num}: OCRエラー - {str(e)}"
+            print(f"画像リサイズエラー: {e}")
+            return image
+    
+    def _ensure_max_size(self, image, max_dimension=4096):
+        """Ensure image doesn't exceed maximum dimension for API"""
+        try:
+            width, height = image.size
+            if width <= max_dimension and height <= max_dimension:
+                return image
+            
+            # Calculate scale factor to fit within max_dimension
+            scale = min(max_dimension / width, max_dimension / height)
+            new_size = (int(width * scale), int(height * scale))
+            resized = image.resize(new_size, Image.Resampling.LANCZOS)
+            print(f"画像サイズ制限適用: {image.size} -> {new_size}")
+            return resized
+        except Exception as e:
+            print(f"画像サイズ制限エラー: {e}")
+            return image
+    
+    def _is_text_valid(self, text):
+        """Check if extracted text is valid (not empty or error message)"""
+        if not text or not text.strip():
+            return False
+        
+        # Check for error messages
+        error_indicators = [
+            "テキストが検出されませんでした",
+            "OCRエラー",
+            "文字起こしに失敗しました",
+            "文字起こし結果がありません"
+        ]
+        
+        text_lower = text.lower()
+        for indicator in error_indicators:
+            if indicator in text:
+                return False
+        
+        # Check if text is too short (likely invalid)
+        if len(text.strip()) < 10:
+            return False
+        
+        return True
+    
+    def _extract_text_from_image(self, image, page_num, resize_on_failure=True):
+        """Extract text from image using Gemini AI with automatic resize retry on failure"""
+        # First, ensure image doesn't exceed API limits
+        image = self._ensure_max_size(image, max_dimension=4096)
+        
+        # Try with original image first, then progressively smaller
+        scale_factors = [1.0, 0.75, 0.5, 0.35, 0.25] if resize_on_failure else [1.0]
+        
+        print(f"ページ {page_num}: OCR処理開始 (元画像サイズ: {image.size})")
+        
+        for scale_factor in scale_factors:
+            try:
+                # Resize image if needed
+                current_image = image
+                if scale_factor < 1.0:
+                    current_image = self._resize_image(image, scale_factor)
+                    print(f"ページ {page_num}: 画像を{scale_factor*100:.0f}%に縮小して再試行中...")
+                
+                # Convert PIL Image to bytes
+                img_byte_arr = io.BytesIO()
+                current_image.save(img_byte_arr, format='PNG')
+                img_byte_arr = img_byte_arr.getvalue()
+                
+                # Check image size in bytes
+                img_size_mb = len(img_byte_arr) / (1024 * 1024)
+                print(f"ページ {page_num}: 画像サイズ {img_size_mb:.2f}MB, 解像度 {current_image.size}")
+                
+                # If image is too large, skip this scale and try smaller
+                if img_size_mb > 20:
+                    print(f"ページ {page_num}: 画像サイズが大きすぎます ({img_size_mb:.2f}MB)。縮小します...")
+                    continue
+                
+                # Generate content with Gemini
+                headers = {
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "contents": [
+                        {
+                            "parts": [
+                                {"text": self.ocr_prompt},
+                                {
+                                    "inline_data": {
+                                        "mime_type": "image/png",
+                                        "data": base64.b64encode(img_byte_arr).decode("utf-8")
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+                
+                print(f"ページ {page_num}: Gemini API呼び出し中...")
+                res = requests.post(
+                    f"{self.endpoint}?key={self.api_key}",
+                    headers=headers,
+                    json=payload,
+                    timeout=180
+                )
+                
+                # Check response status
+                print(f"ページ {page_num}: APIレスポンス status={res.status_code}")
+                
+                res.raise_for_status()
+                data = res.json()
+                
+                # Debug: print response structure
+                if "error" in data:
+                    print(f"ページ {page_num}: APIエラー: {data['error']}")
+                    continue
+                
+                text = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+                
+                if text:
+                    text = text.strip()
+                    print(f"ページ {page_num}: テキスト取得成功 ({len(text)}文字)")
+                    # Check if text is valid
+                    if self._is_text_valid(text):
+                        if scale_factor < 1.0:
+                            print(f"ページ {page_num}: 縮小画像({scale_factor*100:.0f}%)で文字読み取り成功")
+                        return text
+                    # If text is invalid and we have more scale factors to try, continue
+                    elif scale_factor != scale_factors[-1]:
+                        print(f"ページ {page_num}: テキストが無効 (短すぎるか、エラーメッセージ)。次の縮小率を試行します...")
+                        continue
+                    else:
+                        # Last attempt, return what we got
+                        return text if text else f"ページ {page_num}: テキストが検出されませんでした"
+                else:
+                    print(f"ページ {page_num}: テキストが空です")
+                    # Empty response, try next scale factor if available
+                    if scale_factor != scale_factors[-1]:
+                        continue
+                    return f"ページ {page_num}: テキストが検出されませんでした"
+                    
+            except Exception as e:
+                error_msg = str(e)
+                print(f"ページ {page_num}: エラー発生 - {error_msg}")
+                # If quota exceeded, don't retry
+                if "429" in error_msg or "quota" in error_msg.lower():
+                    return f"ページ {page_num}: OCRエラー - {str(e)}"
+                
+                # If this is the last attempt, return error
+                if scale_factor == scale_factors[-1]:
+                    return f"ページ {page_num}: OCRエラー - {str(e)}"
+                
+                # Otherwise, try next scale factor
+                print(f"ページ {page_num}: エラー発生。次の縮小率を試行します: {str(e)}")
+                continue
+        
+        return f"ページ {page_num}: すべての試行が失敗しました"
     
     def _extract_text_from_all_images(self, images_with_pages):
         """Extract text from multiple images with question consolidation"""
@@ -460,18 +576,46 @@ Q2: 理解度は？
                     'text': page_text.strip()
                 })
         
+        # If no results, return empty string
+        if not all_page_results:
+            return ""
+        
         # Consolidate questions across pages
-        return self._consolidate_questions_from_pages(all_page_results)
+        result = self._consolidate_questions_from_pages(all_page_results)
+        
+        # If consolidation returned empty, return raw texts
+        if not result or not result.strip():
+            raw_texts = []
+            for page_result in all_page_results:
+                raw_texts.append(f"--- ページ {page_result['page_num']} ---\n{page_result['text']}")
+            return "\n\n".join(raw_texts)
+        
+        return result
     
     def _extract_with_retry(self, image, page_num, max_retries=1):
-        """Extract text with multiple attempts for better accuracy"""
+        """Extract text with multiple attempts and automatic resize on failure"""
+        # Use _extract_text_from_image which already has resize logic
+        result = self._extract_text_from_image(image, page_num, resize_on_failure=True)
+        
+        # If result is valid, return it
+        if self._is_text_valid(result):
+            return result
+        
+        # If still invalid after resize attempts, try with enhanced prompt
+        scale_factors = [1.0, 0.8, 0.6, 0.4]
         best_result = ""
         
-        for attempt in range(max_retries):
+        for scale_factor in scale_factors:
             try:
+                # Resize image if needed
+                current_image = image
+                if scale_factor < 1.0:
+                    current_image = self._resize_image(image, scale_factor)
+                    print(f"ページ {page_num}: 拡張プロンプトで画像を{scale_factor*100:.0f}%に縮小して再試行中...")
+                
                 # Convert PIL Image to bytes with high quality
                 img_byte_arr = io.BytesIO()
-                image.save(img_byte_arr, format='PNG', quality=100, optimize=False)
+                current_image.save(img_byte_arr, format='PNG', quality=100, optimize=False)
                 img_byte_arr = img_byte_arr.getvalue()
                 
                 # Enhanced prompt for individual page processing
@@ -486,15 +630,6 @@ Q2: 理解度は？
 
 画像を慎重に分析し、手書き文字を正確に文字起こししてください：
 """
-                
-                # Create image content for Gemini
-                content = [
-                    individual_prompt,
-                    {
-                        "mime_type": "image/png", 
-                        "data": img_byte_arr
-                    }
-                ]
                 
                 # REST call
                 payload = {
@@ -526,33 +661,51 @@ Q2: 理解度は？
                     .get("parts", [{}])[0]
                     .get("text", "")
                 ).strip()
-                if current_result:
-                    
-                    # Keep the longest/most detailed result
-                    if len(current_result) > len(best_result):
-                        best_result = current_result
+                
+                if current_result and self._is_text_valid(current_result):
+                    # Found valid result
+                    if scale_factor < 1.0:
+                        print(f"ページ {page_num}: 拡張プロンプトで縮小画像({scale_factor*100:.0f}%)で文字読み取り成功")
+                    return current_result
+                
+                # Keep the longest/most detailed result
+                if len(current_result) > len(best_result):
+                    best_result = current_result
                 
             except Exception as e:
                 error_message = str(e)
-                print(f"Attempt {attempt + 1} failed for page {page_num}: {e}")
+                print(f"ページ {page_num}: 拡張プロンプト試行失敗 (縮小率{scale_factor*100:.0f}%): {e}")
                 
-                # If quota exceeded, wait and don't retry immediately
+                # If quota exceeded, don't retry
                 if "429" in error_message or "quota" in error_message.lower():
                     print(f"Quota exceeded for page {page_num}, skipping retries")
                     break
-                    
+                
+                # Continue to next scale factor
                 continue
+        
+        # Return best result if valid, otherwise return error message
+        if self._is_text_valid(best_result):
+            return best_result
         
         return best_result if best_result else f"ページ {page_num}: 文字起こしに失敗しました"
     
     def _consolidate_questions_from_pages(self, page_results):
         """Consolidate questions and answers from multiple pages"""
+        if not page_results:
+            return ""
+        
         questions_dict = {}
+        raw_texts = []  # Keep raw texts as fallback
         
         # Parse each page's results
         for page_result in page_results:
             page_num = page_result['page_num']
             text = page_result['text']
+            
+            # Keep raw text as fallback
+            if text and text.strip():
+                raw_texts.append(f"--- ページ {page_num} ---\n{text}")
             
             # Extract questions and answers from this page
             questions = self._parse_questions_from_text(text)
@@ -567,6 +720,10 @@ Q2: 理解度は？
                 # Add answer if it's not empty
                 if answer and answer.strip() and answer.strip() not in ['（無回答）', '']:
                     questions_dict[q_num]['answers'].append(answer.strip())
+        
+        # If no questions found, return raw texts
+        if not questions_dict:
+            return "\n\n".join(raw_texts) if raw_texts else ""
         
         # Build final consolidated text
         result_lines = []
