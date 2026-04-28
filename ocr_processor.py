@@ -7,8 +7,26 @@ import os
 import base64
 import numpy as np
 
+GEMINI_MODELS = {
+    "gemini-3.1-pro-preview": {
+        "label": "最高性能 — Gemini 3.1 Pro",
+        "description": "最先端の推論技術を基盤として構築された、マルチモーダル理解において世界最高水準の最もインテリジェントなモデル。",
+    },
+    "gemini-3-flash-preview": {
+        "label": "バランス型 — Gemini 3 Flash",
+        "description": "わずかな費用で大規模なモデルに匹敵するフロンティア クラスのパフォーマンス。",
+    },
+    "gemini-3.1-flash-lite-preview": {
+        "label": "コスト優先 — Gemini 3.1 Flash-Lite",
+        "description": "Gemini 3 シリーズのパフォーマンスと品質を備えた、大量のトラフィックをコスト重視で処理するワークホース モデル。",
+    },
+}
+
+DEFAULT_MODEL = "gemini-3-flash-preview"
+
+
 class OCRProcessor:
-    def __init__(self):
+    def __init__(self, model_name: str = DEFAULT_MODEL):
         """Initialize Gemini AI for OCR processing"""
         # Try Streamlit Cloud secrets first, then env var
         api_key = None
@@ -22,8 +40,7 @@ class OCRProcessor:
             raise ValueError("GEMINI_API_KEY environment variable is required")
         
         self.api_key = api_key
-        # Gemini REST API endpoint (multimodal)
-        self.model_name = 'gemini-3-flash-preview'
+        self.model_name = model_name
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         
         # OCR prompt for Japanese handwritten text

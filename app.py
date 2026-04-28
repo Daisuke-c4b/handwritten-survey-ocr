@@ -3,7 +3,7 @@ import os
 import tempfile
 from io import BytesIO
 import base64
-from ocr_processor import OCRProcessor
+from ocr_processor import OCRProcessor, GEMINI_MODELS, DEFAULT_MODEL
 from document_generator import DocumentGenerator
 from utils import validate_pdf, validate_image, validate_file, get_file_type, extract_filename, get_supported_extensions_list
 
@@ -11,13 +11,37 @@ from utils import validate_pdf, validate_image, validate_file, get_file_type, ex
 def main():
     st.title("手書きアンケートOCR・文字起こしアプリ")
     st.markdown(
-        "手書きのアンケート（PDF・画像）をアップロードして、Gemini AIで文字起こしし、Wordファイルでダウンロードできます。")
+        "手書きのアンケート（PDF・画像）をアップロードし、Google Gemini AI で文字起こしして Word ファイルとしてダウンロードできます。"
+        "  \n使用する Gemini モデルを下のセレクトボックスから選択してください。")
 
     # Initialize session state
     if 'processed_files' not in st.session_state:
         st.session_state.processed_files = []
     if 'ocr_processor' not in st.session_state:
-        # Lazy initialization: create only when needed
+        st.session_state.ocr_processor = None
+    if 'selected_model' not in st.session_state:
+        st.session_state.selected_model = DEFAULT_MODEL
+
+    # Model selection
+    st.header("🤖 Gemini モデルの選択")
+
+    model_options = list(GEMINI_MODELS.keys())
+    model_labels = [GEMINI_MODELS[m]["label"] for m in model_options]
+
+    selected_label = st.selectbox(
+        "使用するモデルを選択してください",
+        options=model_labels,
+        index=model_options.index(st.session_state.selected_model),
+    )
+    selected_model = model_options[model_labels.index(selected_label)]
+
+    st.info(
+        f"**{GEMINI_MODELS[selected_model]['label']}** (`{selected_model}`)  \n"
+        f"{GEMINI_MODELS[selected_model]['description']}"
+    )
+
+    if selected_model != st.session_state.selected_model:
+        st.session_state.selected_model = selected_model
         st.session_state.ocr_processor = None
 
     # File upload section
@@ -81,7 +105,7 @@ def process_files(uploaded_files):
     ocr_processor = st.session_state.ocr_processor
     if ocr_processor is None:
         try:
-            ocr_processor = OCRProcessor()
+            ocr_processor = OCRProcessor(model_name=st.session_state.selected_model)
             st.session_state.ocr_processor = ocr_processor
         except Exception as e:
             st.error(f"Gemini APIの初期化に失敗しました: {str(e)}")
