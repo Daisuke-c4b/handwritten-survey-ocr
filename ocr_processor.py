@@ -7,26 +7,16 @@ import os
 import base64
 import numpy as np
 
-GEMINI_MODELS = {
-    "gemini-3.1-pro-preview": {
-        "label": "最高性能 — Gemini 3.1 Pro",
-        "description": "最先端の推論技術を基盤として構築された、マルチモーダル理解において世界最高水準の最もインテリジェントなモデル。",
-    },
-    "gemini-3-flash-preview": {
-        "label": "バランス型 — Gemini 3 Flash",
-        "description": "わずかな費用で大規模なモデルに匹敵するフロンティア クラスのパフォーマンス。",
-    },
-    "gemini-3.1-flash-lite-preview": {
-        "label": "コスト優先 — Gemini 3.1 Flash-Lite",
-        "description": "Gemini 3 シリーズのパフォーマンスと品質を備えた、大量のトラフィックをコスト重視で処理するワークホース モデル。",
-    },
-}
-
-DEFAULT_MODEL = "gemini-3-flash-preview"
+MODEL_NAME = "gemini-3.1-flash-lite-preview"
+MODEL_LABEL = "Gemini 3.1 Flash-Lite"
+MODEL_DESCRIPTION = (
+    "Gemini 3 シリーズのパフォーマンスと品質を備えた、"
+    "大量のトラフィックをスピード重視で処理するモデル。"
+)
 
 
 class OCRProcessor:
-    def __init__(self, model_name: str = DEFAULT_MODEL):
+    def __init__(self, exclude_texts: list[str] | None = None):
         """Initialize Gemini AI for OCR processing"""
         # Try Streamlit Cloud secrets first, then env var
         api_key = None
@@ -40,11 +30,26 @@ class OCRProcessor:
             raise ValueError("GEMINI_API_KEY environment variable is required")
         
         self.api_key = api_key
-        self.model_name = model_name
+        self.model_name = MODEL_NAME
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
+        self.exclude_texts = [t.strip() for t in (exclude_texts or []) if t.strip()]
         
-        # OCR prompt for Japanese handwritten text
-        self.ocr_prompt = """
+        self.ocr_prompt = self._build_ocr_prompt()
+
+    def _build_ocr_prompt(self) -> str:
+        """Build OCR prompt, optionally including exclude-text instructions."""
+        exclude_section = ""
+        if self.exclude_texts:
+            items = "\n".join(f"  - 「{t}」" for t in self.exclude_texts)
+            exclude_section = f"""
+6. **文字起こし対象外テキスト（重要）**
+   以下の文字列はアンケート用紙に印刷されたタイトルや質問文など、文字起こし不要のテキストです。
+   これらの文字列が画像内に見つかった場合、出力から**完全に除外**してください。
+   部分一致でも該当する場合は除外してください。
+{items}
+"""
+
+        return f"""
 あなたは日本語手書き文字認識の専門家です。画像を非常に注意深く観察し、書かれた文字を一字一句正確に読み取ってください。
 
 **超精密文字認識手順：**
@@ -75,7 +80,7 @@ class OCRProcessor:
    - 質問：Q1: [質問文そのまま]
    - 回答：質問の直下に書かれた通りに記載
    - 空欄：（無回答）
-
+{exclude_section}
 **絶対に守ること：**
 - 見えた文字をそのまま書く
 - 意味を考えて修正しない
