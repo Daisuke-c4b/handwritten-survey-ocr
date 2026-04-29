@@ -13,6 +13,13 @@ from ocr_processor import (
     APP_UPDATED,
 )
 from document_generator import DocumentGenerator
+from template_manager import (
+    list_templates,
+    get_template,
+    add_template,
+    update_template,
+    delete_template,
+)
 from utils import (
     validate_pdf,
     validate_image,
@@ -55,7 +62,9 @@ def _render_exclude_section() -> None:
         "文字起こし不要のテキストを指定できます。"
     )
 
-    tab_text, tab_screenshot = st.tabs(["✏️ テキスト入力", "📸 スクリーンショット"])
+    tab_text, tab_screenshot, tab_template = st.tabs(
+        ["✏️ テキスト入力", "📸 スクリーンショット", "📋 テンプレート"]
+    )
 
     # --- Tab 1: manual text input ---
     with tab_text:
@@ -114,6 +123,111 @@ def _render_exclude_section() -> None:
                 st.session_state.extracted_screenshot_texts = []
                 _invalidate_processor()
                 st.rerun()
+
+    # --- Tab 3: template management ---
+    with tab_template:
+        _render_template_tab()
+
+
+# ---------------------------------------------------------------------------
+# Template tab
+# ---------------------------------------------------------------------------
+
+def _render_template_tab() -> None:
+    templates = list_templates()
+
+    # ---- Load template ----
+    if templates:
+        st.markdown("##### テンプレートを読み込む")
+        tmpl_names = [t["name"] for t in templates]
+        selected = st.selectbox(
+            "テンプレートを選択",
+            options=tmpl_names,
+            index=0,
+            key="tmpl_select",
+            label_visibility="collapsed",
+        )
+        col_load, col_del = st.columns(2)
+        with col_load:
+            if st.button("📥 読み込む", key="tmpl_load", use_container_width=True):
+                tmpl = get_template(selected)
+                if tmpl:
+                    st.session_state.exclude_texts = "\n".join(tmpl["texts"])
+                    _invalidate_processor()
+                    st.rerun()
+        with col_del:
+            if st.button("🗑️ 削除", key="tmpl_delete", use_container_width=True):
+                delete_template(selected)
+                st.success(f"テンプレート「{selected}」を削除しました")
+                st.rerun()
+    else:
+        st.info("保存済みテンプレートはありません。")
+
+    st.divider()
+
+    # ---- Save current as template ----
+    st.markdown("##### 現在の除外テキストをテンプレートとして保存")
+    new_name = st.text_input(
+        "テンプレート名",
+        key="tmpl_new_name",
+        placeholder="例: 顧客満足度アンケート用",
+    )
+    if st.button("💾 保存", key="tmpl_save", use_container_width=True):
+        if not new_name.strip():
+            st.warning("テンプレート名を入力してください。")
+        else:
+            current_texts = [
+                line.strip()
+                for line in st.session_state.exclude_texts.splitlines()
+                if line.strip()
+            ]
+            current_texts.extend(st.session_state.extracted_screenshot_texts)
+            if not current_texts:
+                st.warning("除外テキストが空のため保存できません。")
+            else:
+                try:
+                    add_template(new_name.strip(), current_texts)
+                    st.success(f"テンプレート「{new_name.strip()}」を保存しました")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+    # ---- Edit existing template ----
+    if templates:
+        st.divider()
+        st.markdown("##### テンプレートを編集")
+        edit_target = st.selectbox(
+            "編集するテンプレート",
+            options=[t["name"] for t in templates],
+            index=0,
+            key="tmpl_edit_select",
+        )
+        tmpl_data = get_template(edit_target)
+        edit_name = st.text_input(
+            "テンプレート名",
+            value=edit_target,
+            key="tmpl_edit_name",
+        )
+        edit_texts = st.text_area(
+            "除外テキスト（1 行に 1 つ）",
+            value="\n".join(tmpl_data["texts"]) if tmpl_data else "",
+            height=140,
+            key="tmpl_edit_texts",
+        )
+        if st.button("✏️ 更新", key="tmpl_update", use_container_width=True):
+            if not edit_name.strip():
+                st.warning("テンプレート名を入力してください。")
+            else:
+                new_texts = [l.strip() for l in edit_texts.splitlines() if l.strip()]
+                if not new_texts:
+                    st.warning("除外テキストが空のため更新できません。")
+                else:
+                    try:
+                        update_template(edit_target, edit_name.strip(), new_texts)
+                        st.success(f"テンプレート「{edit_name.strip()}」を更新しました")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
 
 
 # ---------------------------------------------------------------------------
