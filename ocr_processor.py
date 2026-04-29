@@ -7,6 +7,9 @@ import os
 import base64
 import numpy as np
 
+APP_VERSION = "1.1.0"
+APP_UPDATED = "2026-04-30"
+
 MODEL_NAME = "gemini-3.1-flash-lite-preview"
 MODEL_LABEL = "Gemini 3.1 Flash-Lite"
 MODEL_DESCRIPTION = (
@@ -15,21 +18,74 @@ MODEL_DESCRIPTION = (
 )
 
 
+def _get_api_key() -> str:
+    """Resolve Gemini API key from Streamlit secrets or environment."""
+    api_key = None
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY", None)  # type: ignore[attr-defined]
+    except Exception:
+        api_key = None
+    if not api_key:
+        api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY environment variable is required")
+    return api_key
+
+
+def extract_texts_from_screenshots(image_bytes_list: list[bytes]) -> list[str]:
+    """Extract printed text from screenshot images using Gemini (for exclusion)."""
+    api_key = _get_api_key()
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{MODEL_NAME}:generateContent"
+    )
+    prompt = (
+        "この画像に含まれる**印刷された文字**をすべて読み取り、"
+        "1 行に 1 フレーズずつ出力してください。\n"
+        "装飾・説明は不要です。テキストだけを返してください。"
+    )
+
+    extracted: list[str] = []
+    for img_bytes in image_bytes_list:
+        try:
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(img_bytes).decode("utf-8"),
+                        }},
+                    ]
+                }]
+            }
+            res = requests.post(
+                f"{endpoint}?key={api_key}",
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=60,
+            )
+            res.raise_for_status()
+            text = (
+                res.json()
+                .get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+            )
+            for line in text.strip().splitlines():
+                line = line.strip()
+                if line:
+                    extracted.append(line)
+        except Exception as e:
+            print(f"除外テキスト抽出エラー: {e}")
+    return extracted
+
+
 class OCRProcessor:
     def __init__(self, exclude_texts: list[str] | None = None):
         """Initialize Gemini AI for OCR processing"""
-        # Try Streamlit Cloud secrets first, then env var
-        api_key = None
-        try:
-            api_key = st.secrets.get("GEMINI_API_KEY", None)  # type: ignore[attr-defined]
-        except Exception:
-            api_key = None
-        if not api_key:
-            api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY environment variable is required")
-        
-        self.api_key = api_key
+        self.api_key = _get_api_key()
         self.model_name = MODEL_NAME
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         self.exclude_texts = [t.strip() for t in (exclude_texts or []) if t.strip()]
