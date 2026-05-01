@@ -378,16 +378,23 @@ def _render_results() -> None:
     for idx, pf in enumerate(st.session_state.processed_files):
         with st.expander(f"📋 {pf['filename']}", expanded=True):
 
+            # Version counter: incremented on apply/reset to force text_area re-render
+            ver_key = f"text_ver_{idx}"
+            if ver_key not in st.session_state:
+                st.session_state[ver_key] = 0
+            ver = st.session_state[ver_key]
+
             # ---- Editable transcription ----
             st.markdown("**✏️ 文字起こし結果**")
-            st.caption("テキストエリアを直接クリックして編集できます。")
+            st.caption("テキストエリアを直接クリックして編集できます。加工後の結果もここに反映されます。")
             edited = st.text_area(
                 "文字起こし結果",
                 value=pf["current_text"],
-                height=280,
-                key=f"text_area_{idx}",
+                height=300,
+                key=f"text_area_{idx}_v{ver}",
                 label_visibility="collapsed",
             )
+            # Capture manual edits
             if edited != pf["current_text"]:
                 pf["current_text"] = edited
 
@@ -395,10 +402,10 @@ def _render_results() -> None:
 
             # ---- Text editing tools ----
             st.markdown("**🛠️ テキスト加工**")
+            st.caption("加工を適用すると、上のテキストエリアに結果が反映されます。そのまま追加編集も可能です。")
 
-            # Mode descriptions table
             with st.expander("各モードの説明を見る", expanded=False):
-                for key, info in EDITING_MODES.items():
+                for k, info in EDITING_MODES.items():
                     st.markdown(f"**{info['label']}**：{info['description']}")
 
             edit_mode = st.radio(
@@ -441,6 +448,7 @@ def _render_results() -> None:
                                     pf["current_text"], edit_mode, custom_prompt
                                 )
                             pf["current_text"] = result
+                            st.session_state[ver_key] += 1  # Force text_area re-render
                             st.rerun()
                         except Exception as e:
                             st.error(f"加工エラー: {str(e)}")
@@ -452,6 +460,7 @@ def _render_results() -> None:
                     use_container_width=True,
                 ):
                     pf["current_text"] = pf["transcription"]
+                    st.session_state[ver_key] += 1  # Force text_area re-render
                     st.rerun()
 
             st.divider()
