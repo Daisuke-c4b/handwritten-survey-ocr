@@ -20,6 +20,7 @@ from template_manager import (
     update_template,
     delete_template,
 )
+from text_editor import TextEditor, EDITING_MODES
 from utils import (
     validate_pdf,
     validate_image,
@@ -38,6 +39,7 @@ _STATE_DEFAULTS: dict = {
     "exclude_texts": "",
     "exclude_screenshots": [],
     "extracted_screenshot_texts": [],
+    "ocr_mode": "accurate",
 }
 
 
@@ -49,6 +51,39 @@ def _init_session_state() -> None:
 
 def _invalidate_processor() -> None:
     st.session_state.ocr_processor = None
+
+
+# ---------------------------------------------------------------------------
+# OCR mode section
+# ---------------------------------------------------------------------------
+
+def _render_ocr_mode_section() -> None:
+    st.subheader("⚙️ 文字起こしモード")
+
+    mode = st.radio(
+        "文字起こしモード",
+        options=["accurate", "proofread"],
+        format_func=lambda x: {
+            "accurate": "✍️ 正確文字起こし",
+            "proofread": "🔍 校正文字起こし",
+        }[x],
+        index=0 if st.session_state.ocr_mode == "accurate" else 1,
+        horizontal=True,
+        key="ocr_mode_radio",
+        label_visibility="collapsed",
+    )
+
+    if mode != st.session_state.ocr_mode:
+        st.session_state.ocr_mode = mode
+        _invalidate_processor()
+
+    if mode == "accurate":
+        st.caption("書かれている文字をそのまま一字一句正確に転写します。")
+    else:
+        st.caption(
+            "二重線の訂正・丸印による選択など校正箇所を検出し、"
+            "不自然な表現も指摘します。結果に【校正注記】が付加されます。"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +287,10 @@ def _process_files(uploaded_files: list) -> None:
     ocr_processor = st.session_state.ocr_processor
     if ocr_processor is None:
         try:
-            ocr_processor = OCRProcessor(exclude_texts=_collect_exclude_texts())
+            ocr_processor = OCRProcessor(
+                exclude_texts=_collect_exclude_texts(),
+                ocr_mode=st.session_state.ocr_mode,
+            )
             st.session_state.ocr_processor = ocr_processor
         except Exception as e:
             st.error(f"Gemini API の初期化に失敗しました: {str(e)}")
@@ -261,7 +299,6 @@ def _process_files(uploaded_files: list) -> None:
                 "または .streamlit/secrets.toml に設定されているか確認してください。"
             )
             return
-    doc_generator = DocumentGenerator()
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -304,16 +341,11 @@ def _process_files(uploaded_files: list) -> None:
                     st.warning(f"⚠️ {uploaded_file.name}: 文字起こし結果が空です")
                     continue
 
-                with st.spinner(f"Word ファイル生成中: {uploaded_file.name}"):
-                    word_content = doc_generator.create_document(
-                        transcription, uploaded_file.name
-                    )
-
                 st.session_state.processed_files.append(
                     {
                         "filename": uploaded_file.name,
                         "transcription": transcription,
-                        "word_content": word_content,
+                        "current_text": transcription,
                     }
                 )
                 st.success(f"✅ {uploaded_file.name}: 処理完了")
@@ -328,6 +360,124 @@ def _process_files(uploaded_files: list) -> None:
     progress_bar.progress(1.0)
     status_text.text("すべての処理が完了しました！")
     st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Results section
+# ---------------------------------------------------------------------------
+
+def _render_results() -> None:
+    if not st.session_state.processed_files:
+        return
+
+    st.divider()
+    st.subheader("📄 処理結果")
+
+    doc_generator = DocumentGenerator()
+
+    for idx, pf in enumerate(st.session_state.processed_files):
+        with st.expander(f"📋 {pf['filename']}", expanded=True):
+
+            # ---- Editable transcription ----
+            st.markdown("**✏️ 文字起こし結果**")
+            st.caption("テキストエリアを直接クリックして編集できます。")
+            edited = st.text_area(
+                "文字起こし結果",
+                value=pf["current_text"],
+                height=280,
+                key=f"text_area_{idx}",
+                label_visibility="collapsed",
+            )
+            if edited != pf["current_text"]:
+                pf["current_text"] = edited
+
+            st.divider()
+
+            # ---- Text editing tools ----
+            st.markdown("**🛠️ テキスト加工**")
+
+            # Mode descriptions table
+            with st.expander("各モードの説明を見る", expanded=False):
+                for key, info in EDITING_MODES.items():
+                    st.markdown(f"**{info['label']}**：{info['description']}")
+
+            edit_mode = st.radio(
+                "加工モード",
+                options=list(EDITING_MODES.keys()),
+                format_func=lambda x: f"{EDITING_MODES[x]['label']}　— {EDITING_MODES[x]['short_desc']}",
+                horizontal=False,
+                key=f"edit_mode_{idx}",
+                label_visibility="collapsed",
+            )
+
+            custom_prompt = ""
+            if edit_mode == "custom":
+                custom_prompt = st.text_area(
+                    "カスタムプロンプト",
+                    placeholder=(
+                        "例: 敬語に変換してください\n"
+                        "例: 重要な箇所を箇条書きにまとめてください\n"
+                        "例: 英語に翻訳してください"
+                    ),
+                    height=100,
+                    key=f"custom_prompt_{idx}",
+                )
+
+            col_apply, col_reset = st.columns([2, 1])
+            with col_apply:
+                if st.button(
+                    f"✨ {EDITING_MODES[edit_mode]['label']}を適用",
+                    key=f"apply_{idx}",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    if edit_mode == "custom" and not custom_prompt.strip():
+                        st.warning("カスタムプロンプトを入力してください。")
+                    else:
+                        try:
+                            editor = TextEditor()
+                            with st.spinner("テキストを加工中..."):
+                                result = editor.apply_editing(
+                                    pf["current_text"], edit_mode, custom_prompt
+                                )
+                            pf["current_text"] = result
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"加工エラー: {str(e)}")
+
+            with col_reset:
+                if st.button(
+                    "↩️ 元に戻す",
+                    key=f"reset_{idx}",
+                    use_container_width=True,
+                ):
+                    pf["current_text"] = pf["transcription"]
+                    st.rerun()
+
+            st.divider()
+
+            # ---- Download ----
+            st.markdown("**📥 Word ダウンロード**")
+            st.caption("現在のテキスト（加工済みの場合は加工後）でファイルを生成します。")
+            try:
+                word_content = doc_generator.create_document(
+                    pf["current_text"], pf["filename"]
+                )
+                st.download_button(
+                    label="📥 Word ファイルをダウンロード",
+                    data=word_content,
+                    file_name=f"{extract_filename(pf['filename'])}_transcription.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                    key=f"download_{idx}",
+                )
+            except Exception as e:
+                st.error(f"Word 生成エラー: {str(e)}")
+
+    st.divider()
+    if st.button("🗑️ すべてクリア", use_container_width=True):
+        st.session_state.processed_files = []
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +516,11 @@ def main():
 
     st.divider()
 
+    # ---- OCR mode ----
+    _render_ocr_mode_section()
+
+    st.divider()
+
     # ---- Exclude section ----
     _render_exclude_section()
 
@@ -394,30 +549,7 @@ def main():
             _process_files(uploaded_files)
 
     # ---- Results ----
-    if st.session_state.processed_files:
-        st.divider()
-        st.subheader("📄 処理結果")
-
-        for idx, pf in enumerate(st.session_state.processed_files):
-            with st.expander(f"📋 {pf['filename']}", expanded=False):
-                st.text_area(
-                    "文字起こし結果:",
-                    pf["transcription"],
-                    height=200,
-                    disabled=True,
-                    key=f"transcription_text_{idx}",
-                )
-                st.download_button(
-                    label="📥 Word ファイルをダウンロード",
-                    data=pf["word_content"],
-                    file_name=f"{extract_filename(pf['filename'])}_transcription.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                )
-
-        if st.button("🗑️ すべてクリア", use_container_width=True):
-            st.session_state.processed_files = []
-            st.rerun()
+    _render_results()
 
 
 if __name__ == "__main__":

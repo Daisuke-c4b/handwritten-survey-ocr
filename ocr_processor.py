@@ -83,21 +83,28 @@ def extract_texts_from_screenshots(image_bytes_list: list[bytes]) -> list[str]:
 
 
 class OCRProcessor:
-    def __init__(self, exclude_texts: list[str] | None = None):
+    def __init__(self, exclude_texts: list[str] | None = None, ocr_mode: str = "accurate"):
         """Initialize Gemini AI for OCR processing"""
         self.api_key = _get_api_key()
         self.model_name = MODEL_NAME
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         self.exclude_texts = [t.strip() for t in (exclude_texts or []) if t.strip()]
-        
+        self.ocr_mode = ocr_mode
+
         self.ocr_prompt = self._build_ocr_prompt()
 
     def _build_ocr_prompt(self) -> str:
-        """Build OCR prompt, optionally including exclude-text instructions."""
-        exclude_section = ""
-        if self.exclude_texts:
-            items = "\n".join(f"  - 「{t}」" for t in self.exclude_texts)
-            exclude_section = f"""
+        """Route to mode-specific prompt builder."""
+        if self.ocr_mode == "proofread":
+            return self._build_proofread_prompt()
+        return self._build_accurate_prompt()
+
+    def _build_exclude_section(self) -> str:
+        """Build exclude-text instructions section."""
+        if not self.exclude_texts:
+            return ""
+        items = "\n".join(f"  - 「{t}」" for t in self.exclude_texts)
+        return f"""
 6. **文字起こし対象外テキスト（重要）**
    以下の文字列はアンケート用紙に印刷されたタイトルや質問文など、文字起こし不要のテキストです。
    これらの文字列が画像内に見つかった場合、出力から**完全に除外**してください。
@@ -105,6 +112,9 @@ class OCRProcessor:
 {items}
 """
 
+    def _build_accurate_prompt(self) -> str:
+        """Build accurate transcription prompt."""
+        exclude_section = self._build_exclude_section()
         return f"""
 あなたは日本語手書き文字認識の専門家です。画像を非常に注意深く観察し、書かれた文字を一字一句正確に読み取ってください。
 
@@ -142,6 +152,58 @@ class OCRProcessor:
 - 推測で文字を補完しない
 
 この画像の手書き文字を正確に読み取ってください：
+"""
+
+    def _build_proofread_prompt(self) -> str:
+        """Build proofread mode prompt."""
+        exclude_section = self._build_exclude_section()
+        return f"""
+あなたは日本語手書き文字認識・校正の専門家です。画像を非常に注意深く観察し、手書き文字の認識と校正を同時に行ってください。
+
+**超精密文字認識手順：**
+
+1. **画像全体の観察**
+   - 全体レイアウトを把握
+   - 質問と回答の位置関係を確認
+   - 文字の配置パターンを理解
+   - 訂正箇所（二重線・取り消し線・修正テープなど）を特定
+   - 丸印・チェックマークなどの選択表示を確認
+
+2. **文字単位での詳細分析**
+   - 各文字の形状を慎重に観察
+   - 画線の太さ、角度、曲がり具合を分析
+   - 文字の一部が欠けていても、見える部分から判断
+
+3. **日本語文字の特別な注意点**
+   - ひらがな：「る/ろ」「は/ば/ぱ」「き/さ」「な/た」「わ/れ」「め/ぬ」
+   - カタカナ：「ソ/ン」「シ/ツ」「ク/ワ」「ロ/コ」「エ/ユ」
+   - 漢字：似た形の字に特に注意
+   - 濁点・半濁点の有無を慎重に確認
+
+4. **文字起こしの原則**
+   - 訂正がある場合は訂正後の文字を採用して転写
+   - 丸印・チェックで選択された選択肢を記録
+   - 誤字があってもそのまま記録
+   - 判読不能な文字は「？」で表記
+
+5. **出力形式**
+   - 書かれている文字（訂正後）をそのまま出力する
+   - 特定のフォーマットは適用しない
+   - 校正箇所は文字起こし本文の後に【校正注記】としてまとめる
+
+**校正検出指示（重要）：**
+以下を検出した場合、文字起こし本文の後に「【校正注記】」セクションを設けて記載してください：
+- **二重線・取り消し線による訂正**：「校正: 「元の文字」→「訂正後の文字」」
+- **丸印・チェックによる選択回答**：「選択: 「選ばれた選択肢」」
+- **文脈から不自然・矛盾している表現**：「要確認: 「該当箇所」（理由を簡潔に）」
+校正注記がない場合は【校正注記】セクション自体を省略してください。
+{exclude_section}
+**絶対に守ること：**
+- 訂正後の文字を正として転写する
+- 校正箇所は本文ではなく【校正注記】にまとめる
+- 推測で文字を補完しない
+
+この画像の手書き文字を正確に読み取り、校正箇所も検出してください：
 """
 
     def process_pdf(self, pdf_path):
