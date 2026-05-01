@@ -1,33 +1,19 @@
+import time
 import requests
 from ocr_processor import _get_api_key, MODEL_NAME
 
 EDITING_MODES: dict[str, dict] = {
-    "kebatori": {
-        "label": "ケバ取り",
-        "short_desc": "フィラー語・言い直しを削除",
-        "description": (
-            "「えー」「あー」「えっと」「まあ」「なんか」などのフィラー語（不要な言葉）や、"
-            "言い直し（「○○、じゃなくて△△」など）、重複表現を自動で削除します。"
-            "内容・意味は変えず、読みやすく整理します。"
-        ),
-        "prompt": (
-            "以下の文字起こしテキストから、「えー」「あー」「えっと」「まあ」「なんか」などの"
-            "フィラー語、言い直し、重複表現を除去してください。"
-            "内容・意味は変えずに、整理したテキストのみ出力してください。\n\n"
-            "元のテキスト：\n{text}"
-        ),
-    },
     "seimon": {
         "label": "整文",
-        "short_desc": "句読点補完・文体を整理",
+        "short_desc": "です・ます調に整えて文体を統一",
         "description": (
-            "句読点の補完・文体の統一・文章の流れを整えます。"
-            "話し言葉を書き言葉に整えますが、内容・意味は変えません。"
+            "句読点の補完・文体の統一を行い、文章全体をです・ます調に整えます。"
+            "話し言葉を丁寧な書き言葉に変えますが、内容・意味は変えません。"
             "アンケート回答を正式な記録文書として仕上げたいときに適しています。"
         ),
         "prompt": (
             "以下の文字起こしテキストを整文してください。"
-            "句読点を適切に補完し、文章の流れを整えて自然な日本語の書き言葉にしてください。"
+            "句読点を適切に補完し、文章全体を「です・ます調」に統一してください。"
             "内容・意味は変えずに、整文後のテキストのみ出力してください。\n\n"
             "元のテキスト：\n{text}"
         ),
@@ -59,6 +45,34 @@ EDITING_MODES: dict[str, dict] = {
     },
 }
 
+_SURVEY_ANALYSIS_PROMPT = """
+あなたはアンケート分析の専門家です。以下のアンケート回答をもとに、詳細な分析レポートを作成してください。
+
+【アンケート回答】
+{combined}
+
+---
+
+以下の観点で分析し、それぞれ具体的に記述してください：
+
+## 1. 全体的な傾向・概要
+回答全体を俯瞰し、共通するテーマや傾向をまとめてください。
+
+## 2. 主な意見・感想のカテゴリ分け
+回答を内容でグループ化し、各カテゴリの代表的な意見を挙げてください。
+
+## 3. 課題・改善が必要な点
+ネガティブな意見や要望から、対応が必要な課題を整理してください。
+
+## 4. アクションプラン（具体的な対応策）
+課題に対して、実行可能な具体的アクションを優先度付きで提案してください。
+
+## 5. 今後の研修・施策への改善提案
+アンケート結果を踏まえ、次回以降の研修や取り組みへの改善提案をしてください。
+
+分析は具体的かつ実用的な内容にし、現場で活用できる提案を心がけてください。
+"""
+
 
 class TextEditor:
     def __init__(self):
@@ -81,19 +95,50 @@ class TextEditor:
 
         return self._call_gemini(prompt)
 
-    def _call_gemini(self, prompt: str) -> str:
+    def analyze_survey(self, texts: list[str], filenames: list[str]) -> str:
+        """Analyze survey responses and generate an action plan."""
+        sections = []
+        for fn, t in zip(filenames, texts):
+            sections.append(f"【{fn}】\n{t}")
+        combined = "\n\n---\n\n".join(sections)
+        prompt = _SURVEY_ANALYSIS_PROMPT.format(combined=combined)
+        return self._call_gemini(prompt)
+
+    def _call_gemini(self, prompt: str, max_retries: int = 3) -> str:
+        """Call Gemini API with exponential backoff retry on 5xx errors."""
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
-        res = requests.post(
-            f"{self.endpoint}?key={self.api_key}",
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=120,
-        )
-        res.raise_for_status()
-        return (
-            res.json()
-            .get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        ).strip()
+        last_err: Exception = RuntimeError("API呼び出しに失敗しました")
+
+        for attempt in range(max_retries):
+            try:
+                res = requests.post(
+                    f"{self.endpoint}?key={self.api_key}",
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                    timeout=120,
+                )
+                res.raise_for_status()
+                return (
+                    res.json()
+                    .get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                ).strip()
+            except requests.HTTPError as e:
+                last_err = e
+                status = e.response.status_code if e.response is not None else 0
+                # Retry on 5xx (server-side) errors
+                if status >= 500 and attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 1s → 2s → 4s
+                    time.sleep(wait)
+                    continue
+                raise
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise
+
+        raise last_err

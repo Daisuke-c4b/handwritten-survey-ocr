@@ -40,6 +40,7 @@ _STATE_DEFAULTS: dict = {
     "exclude_screenshots": [],
     "extracted_screenshot_texts": [],
     "ocr_mode": "accurate",
+    "survey_analysis": "",
 }
 
 
@@ -483,9 +484,66 @@ def _render_results() -> None:
             except Exception as e:
                 st.error(f"Word 生成エラー: {str(e)}")
 
+    # ---- Survey analysis ----
+    st.divider()
+    st.markdown("### 📊 アンケート分析")
+    st.caption(
+        "文字起こし結果（加工済みの場合はその内容）をもとに、"
+        "全体の傾向・課題・アクションプラン・研修改善案を自動生成します。"
+    )
+
+    if st.button(
+        "📊 アンケートをまとめて分析",
+        use_container_width=True,
+        type="primary",
+        key="analyze_btn",
+    ):
+        try:
+            editor = TextEditor()
+            texts = [pf["current_text"] for pf in st.session_state.processed_files]
+            filenames = [pf["filename"] for pf in st.session_state.processed_files]
+            with st.spinner("アンケートを分析中... しばらくお待ちください"):
+                analysis = editor.analyze_survey(texts, filenames)
+            st.session_state.survey_analysis = analysis
+            st.rerun()
+        except Exception as e:
+            st.error(f"分析エラー: {str(e)}")
+
+    if st.session_state.survey_analysis:
+        st.markdown("**分析結果**")
+        st.caption("テキストエリアを直接編集できます。")
+        st.text_area(
+            "分析結果",
+            value=st.session_state.survey_analysis,
+            height=500,
+            key="analysis_area",
+            label_visibility="collapsed",
+        )
+        try:
+            analysis_word = doc_generator.create_document(
+                st.session_state.survey_analysis, "アンケート分析結果"
+            )
+            col_dl, col_clear = st.columns([3, 1])
+            with col_dl:
+                st.download_button(
+                    label="📥 分析結果を Word でダウンロード",
+                    data=analysis_word,
+                    file_name="アンケート分析結果.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                    key="download_analysis",
+                )
+            with col_clear:
+                if st.button("🗑️ 分析をクリア", use_container_width=True, key="clear_analysis"):
+                    st.session_state.survey_analysis = ""
+                    st.rerun()
+        except Exception as e:
+            st.error(f"Word 生成エラー: {str(e)}")
+
     st.divider()
     if st.button("🗑️ すべてクリア", use_container_width=True):
         st.session_state.processed_files = []
+        st.session_state.survey_analysis = ""
         st.rerun()
 
 
