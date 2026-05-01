@@ -75,9 +75,8 @@ def _render_exclude_section() -> None:
             height=140,
             placeholder=(
                 "例:\n"
-                "顧客満足度アンケート\n"
-                "Q1. 本日のセミナーの満足度を教えてください\n"
-                "Q2. 理解度はいかがでしたか"
+                "1.本講座の中で、興味を持った・参考になった等、感想や心に残ったことをお聞かせください\n"
+                "2.その他、ご意見、ご要望等お気づきの点がありましたらご記入ください"
             ),
             label_visibility="collapsed",
         )
@@ -170,7 +169,7 @@ def _render_template_tab() -> None:
     new_name = st.text_input(
         "テンプレート名",
         key="tmpl_new_name",
-        placeholder="例: 顧客満足度アンケート用",
+        placeholder="例: 研修アンケート用",
     )
     if st.button("💾 保存", key="tmpl_save", use_container_width=True):
         if not new_name.strip():

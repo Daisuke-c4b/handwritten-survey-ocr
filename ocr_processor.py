@@ -7,8 +7,8 @@ import os
 import base64
 import numpy as np
 
-APP_VERSION = "1.1.0"
-APP_UPDATED = "2026-04-30"
+APP_VERSION = "1.2.0"
+APP_UPDATED = "2026-05-01"
 
 MODEL_NAME = "gemini-3.1-flash-lite-preview"
 MODEL_LABEL = "Gemini 3.1 Flash-Lite"
