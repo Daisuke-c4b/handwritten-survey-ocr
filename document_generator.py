@@ -1,9 +1,11 @@
+import re
+import datetime
+from io import BytesIO
+
 from docx import Document
-from docx.shared import Inches, Pt
+from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
-from io import BytesIO
-import datetime
 
 class DocumentGenerator:
     def __init__(self):
@@ -280,6 +282,86 @@ class DocumentGenerator:
             except:
                 pass
     
+    # ------------------------------------------------------------------
+    # Analysis document (Markdown → Word)
+    # ------------------------------------------------------------------
+
+    def create_analysis_document(self, markdown_text: str) -> bytes:
+        """Create a Word document from a markdown-formatted analysis report."""
+        doc = Document()
+        self._set_default_font(doc)
+
+        title = doc.add_heading("アンケート分析レポート", 0)
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        self._apply_font_formatting(title, "MS Gothic", 14, True)
+
+        doc.add_paragraph()
+        meta = doc.add_paragraph()
+        r1 = meta.add_run("作成日時: ")
+        r1.bold = True
+        meta.add_run(datetime.datetime.now().strftime("%Y年%m月%d日 %H:%M:%S"))
+        self._apply_font_formatting(meta, "MS Gothic", 11)
+
+        sep = doc.add_paragraph("=" * 50)
+        self._apply_font_formatting(sep, "MS Gothic", 11)
+
+        self._add_markdown_content(doc, markdown_text)
+
+        buf = BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+
+    def _add_markdown_content(self, doc: Document, text: str) -> None:
+        """Parse markdown text and add to Word document with proper formatting."""
+        for line in text.splitlines():
+            stripped = line.rstrip()
+
+            if not stripped:
+                doc.add_paragraph()
+                continue
+
+            if stripped.startswith("### "):
+                h = doc.add_heading(stripped[4:], level=3)
+                self._apply_font_formatting(h, "MS Gothic", 12, True)
+            elif stripped.startswith("## "):
+                h = doc.add_heading(stripped[3:], level=2)
+                self._apply_font_formatting(h, "MS Gothic", 13, True)
+            elif stripped.startswith("# "):
+                h = doc.add_heading(stripped[2:], level=1)
+                self._apply_font_formatting(h, "MS Gothic", 14, True)
+            elif stripped.startswith(("- ", "* ", "・")):
+                prefix_len = 2 if stripped[1] == " " else 1
+                para = doc.add_paragraph(style="List Bullet")
+                self._add_inline_runs(para, stripped[prefix_len:], "MS Gothic", 11)
+            else:
+                para = doc.add_paragraph()
+                self._add_inline_runs(para, stripped, "MS Gothic", 11)
+
+    def _add_inline_runs(
+        self,
+        para,
+        text: str,
+        font_name: str = "MS Gothic",
+        font_size: int = 11,
+    ) -> None:
+        """Split text on **bold** markers and add runs with correct formatting."""
+        parts = re.split(r"(\*\*[^*]+\*\*)", text)
+        for part in parts:
+            if part.startswith("**") and part.endswith("**"):
+                run = para.add_run(part[2:-2])
+                run.bold = True
+            else:
+                if not part:
+                    continue
+                run = para.add_run(part)
+            run.font.name = font_name
+            run.font.size = Pt(font_size)
+
+    # ------------------------------------------------------------------
+    # Font helpers
+    # ------------------------------------------------------------------
+
     def _apply_font_formatting(self, paragraph, font_name='MS Gothic', font_size=11, bold=False):
         """Apply font formatting to paragraph with strong enforcement"""
         try:

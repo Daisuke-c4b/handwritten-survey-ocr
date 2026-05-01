@@ -11,6 +11,7 @@ from ocr_processor import (
     MODEL_DESCRIPTION,
     APP_VERSION,
     APP_UPDATED,
+    CHANGELOG,
 )
 from document_generator import DocumentGenerator
 from template_manager import (
@@ -520,8 +521,8 @@ def _render_results() -> None:
             label_visibility="collapsed",
         )
         try:
-            analysis_word = doc_generator.create_document(
-                st.session_state.survey_analysis, "アンケート分析結果"
+            analysis_word = doc_generator.create_analysis_document(
+                st.session_state.survey_analysis
             )
             col_dl, col_clear = st.columns([3, 1])
             with col_dl:
@@ -580,6 +581,16 @@ def main():
             f"Ver. {APP_VERSION}<br>{APP_UPDATED} 更新</div>",
             unsafe_allow_html=True,
         )
+
+    with st.expander("📋 更新履歴", expanded=False):
+        for entry in CHANGELOG:
+            st.markdown(
+                f"**v{entry['version']}** &nbsp; "
+                f"<span style='color:gray; font-size:0.9em;'>{entry['date']}</span>",
+                unsafe_allow_html=True,
+            )
+            for change in entry["changes"]:
+                st.markdown(f"&nbsp;&nbsp;• {change}")
 
     st.divider()
 
