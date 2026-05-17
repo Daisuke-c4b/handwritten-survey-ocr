@@ -93,7 +93,6 @@ def _render_ocr_mode_section() -> None:
 # ---------------------------------------------------------------------------
 
 def _render_exclude_section() -> None:
-    st.subheader("🚫 文字起こし除外設定")
     st.caption(
         "アンケート用紙に印刷されているタイトルや質問文など、"
         "文字起こし不要のテキストを指定できます。"
@@ -599,8 +598,9 @@ def main():
 
     st.divider()
 
-    # ---- Exclude section ----
-    _render_exclude_section()
+    # ---- Exclude section (collapsed by default) ----
+    with st.expander("🚫 文字起こし除外設定", expanded=False):
+        _render_exclude_section()
 
     st.divider()
 
