@@ -7,8 +7,8 @@ import os
 import base64
 import numpy as np
 
-APP_VERSION = "1.3.0"
-APP_UPDATED = "2026-05-01"
+APP_VERSION = "1.4.0"
+APP_UPDATED = "2026-05-25"
 
 MODEL_NAME = "gemini-3.1-flash-lite-preview"
 MODEL_LABEL = "Gemini 3.1 Flash-Lite"
@@ -18,6 +18,16 @@ MODEL_DESCRIPTION = (
 )
 
 CHANGELOG: list[dict] = [
+    {
+        "version": "1.4.0",
+        "date": "2026-05-25",
+        "changes": [
+            "「質問ごとにまとめる」を強化: 質問境界を厳守し、Q2 の回答が Q1 に混入する事象を解消",
+            "OCR 集約結果の各回答にページ識別子 [P.N] を付与し、同一回答者を追跡可能に",
+            "新機能: 文字校正チェック（コピペしたテキストの誤字脱字・違和感のある文体・不自然な日本語を検出）",
+            "校正レポートを Markdown 形式で表示し、Word ファイルとしてもダウンロード可能に",
+        ],
+    },
     {
         "version": "1.3.0",
         "date": "2026-05-01",
@@ -845,52 +855,51 @@ class OCRProcessor:
         return best_result if best_result else f"ページ {page_num}: 文字起こしに失敗しました"
     
     def _consolidate_questions_from_pages(self, page_results):
-        """Consolidate questions and answers from multiple pages"""
+        """Consolidate questions and answers from multiple pages.
+
+        各回答には [P.N] のページ識別子を付与し、同一回答者の追跡を可能にする。
+        """
         if not page_results:
             return ""
-        
-        questions_dict = {}
-        raw_texts = []  # Keep raw texts as fallback
-        
-        # Parse each page's results
+
+        questions_dict: dict[int, dict] = {}
+        raw_texts: list[str] = []
+
         for page_result in page_results:
             page_num = page_result['page_num']
             text = page_result['text']
-            
-            # Keep raw text as fallback
+
             if text and text.strip():
                 raw_texts.append(f"--- ページ {page_num} ---\n{text}")
-            
-            # Extract questions and answers from this page
+
             questions = self._parse_questions_from_text(text)
-            
+
             for q_num, q_text, answer in questions:
                 if q_num not in questions_dict:
                     questions_dict[q_num] = {
                         'question': q_text,
                         'answers': []
                     }
-                
-                # Add answer if it's not empty
+
                 if answer and answer.strip() and answer.strip() not in ['（無回答）', '']:
-                    questions_dict[q_num]['answers'].append(answer.strip())
-        
-        # If no questions found, return raw texts
+                    questions_dict[q_num]['answers'].append({
+                        'page': page_num,
+                        'text': answer.strip(),
+                    })
+
         if not questions_dict:
             return "\n\n".join(raw_texts) if raw_texts else ""
-        
-        # Build final consolidated text
-        result_lines = []
+
+        result_lines: list[str] = []
         for q_num in sorted(questions_dict.keys()):
             q_data = questions_dict[q_num]
             result_lines.append(f"Q{q_num}: {q_data['question']}")
-            
-            # Add answers as bullet points
-            for answer in q_data['answers']:
-                result_lines.append(f"・{answer}")
-            
-            result_lines.append("")  # Empty line between questions
-        
+
+            for ans in q_data['answers']:
+                result_lines.append(f"・[P.{ans['page']}] {ans['text']}")
+
+            result_lines.append("")
+
         return "\n".join(result_lines)
     
     def _parse_questions_from_text(self, text):

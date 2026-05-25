@@ -42,6 +42,8 @@ _STATE_DEFAULTS: dict = {
     "extracted_screenshot_texts": [],
     "ocr_mode": "accurate",
     "survey_analysis": "",
+    "proofread_input": "",
+    "proofread_result": "",
 }
 
 
@@ -277,6 +279,102 @@ def _collect_exclude_texts() -> list[str]:
             texts.append(line)
     texts.extend(st.session_state.extracted_screenshot_texts)
     return texts
+
+
+# ---------------------------------------------------------------------------
+# Standalone proofread (paste-and-check) section
+# ---------------------------------------------------------------------------
+
+def _render_proofread_section() -> None:
+    """Render the standalone copy-paste proofread / quality-check feature.
+
+    OCR を介さず、ユーザーがアンケートのテキストデータを貼り付けて
+    誤字脱字・違和感のある文体・不自然な日本語をチェックできる。
+    """
+    st.caption(
+        "アンケートの文字データを貼り付けて、**誤字脱字・違和感のある文体・"
+        "不自然な日本語**をチェックできます。OCR を介さず既存テキストの校正に使えます。"
+    )
+
+    proof_input = st.text_area(
+        "校正対象のテキスト",
+        value=st.session_state.proofread_input,
+        height=240,
+        key="proofread_input_area",
+        placeholder=(
+            "ここにアンケートの文字データを貼り付けてください。\n"
+            "（例）昨日の研修はとても勉強なりました。とくに事例紹介の部分が良かったです。"
+        ),
+    )
+    if proof_input != st.session_state.proofread_input:
+        st.session_state.proofread_input = proof_input
+
+    col_run, col_clear = st.columns([3, 1])
+    with col_run:
+        run_clicked = st.button(
+            "🔍 校正チェックを実行",
+            key="proofread_run",
+            use_container_width=True,
+            type="primary",
+        )
+    with col_clear:
+        clear_clicked = st.button(
+            "🗑️ クリア",
+            key="proofread_clear",
+            use_container_width=True,
+        )
+
+    if clear_clicked:
+        st.session_state.proofread_input = ""
+        st.session_state.proofread_result = ""
+        st.rerun()
+
+    if run_clicked:
+        if not st.session_state.proofread_input.strip():
+            st.warning("校正対象のテキストを入力してください。")
+        else:
+            try:
+                editor = TextEditor()
+                with st.spinner("テキストを校正中... しばらくお待ちください"):
+                    result = editor.check_text_quality(
+                        st.session_state.proofread_input
+                    )
+                st.session_state.proofread_result = result
+                st.rerun()
+            except Exception as e:
+                st.error(f"校正エラー: {str(e)}")
+
+    if st.session_state.proofread_result:
+        st.markdown("**校正結果**")
+        st.markdown(st.session_state.proofread_result)
+
+        st.caption("結果テキストをコピーしたい場合は以下のエリアから取得できます。")
+        st.text_area(
+            "校正結果（コピー用）",
+            value=st.session_state.proofread_result,
+            height=200,
+            key="proofread_result_area",
+            label_visibility="collapsed",
+        )
+
+        try:
+            doc_generator = DocumentGenerator()
+            proof_word = doc_generator.create_analysis_document(
+                st.session_state.proofread_result
+            )
+            st.download_button(
+                label="📥 校正結果を Word でダウンロード",
+                data=proof_word,
+                file_name="校正チェック結果.docx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                use_container_width=True,
+                key="proofread_download",
+            )
+        except Exception as e:
+            st.error(f"Word 生成エラー: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +726,12 @@ def main():
 
     # ---- Results ----
     _render_results()
+
+    # ---- Standalone proofread section ----
+    st.divider()
+    st.subheader("📝 文字校正チェック（コピペ）")
+    with st.expander("テキストを貼り付けて誤字脱字・違和感をチェックする", expanded=False):
+        _render_proofread_section()
 
 
 if __name__ == "__main__":
