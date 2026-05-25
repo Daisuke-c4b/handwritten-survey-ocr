@@ -1,6 +1,7 @@
 import time
 import requests
 from ocr_processor import _get_api_key, MODEL_NAME
+from cost_tracker import TimedCall
 
 EDITING_MODES: dict[str, dict] = {
     "matome": {
@@ -90,6 +91,22 @@ EDITING_MODES: dict[str, dict] = {
     },
 }
 
+_TEXT_QUALITY_FIX_PROMPT = """
+あなたは日本語校正の専門家です。以下のアンケートテキストを校正してください。
+誤字脱字・違和感のある文体・不自然な日本語を全て修正した、自然で読みやすい
+日本語のテキストを返してください。
+
+【厳守事項】
+- 修正後のテキスト本文のみを返してください。前置き・注釈・Markdown 記号は禁止です。
+- 文体は対象テキストの主たる文体（敬体/常体）に合わせて統一してください。
+- 内容・意味・情報量は変えないでください（追加・削除はしない）。
+- 改行・段落構造はできるだけ保ってください。
+
+【対象テキスト】
+{text}
+"""
+
+
 _TEXT_QUALITY_CHECK_PROMPT = """
 あなたは日本語校正の専門家です。以下のアンケートテキストを慎重に読み、
 「誤字脱字」「違和感のある文体」「不自然な日本語」を検出してレポートしてください。
@@ -172,12 +189,14 @@ class TextEditor:
             if not custom_prompt.strip():
                 return text
             prompt = f"{custom_prompt.strip()}\n\n対象テキスト：\n{text}"
+            purpose = "編集: カスタム"
         elif mode in EDITING_MODES:
             prompt = EDITING_MODES[mode]["prompt"].format(text=text)
+            purpose = f"編集: {EDITING_MODES[mode]['label']}"
         else:
             return text
 
-        return self._call_gemini(prompt)
+        return self._call_gemini(prompt, purpose=purpose)
 
     def analyze_survey(self, texts: list[str], filenames: list[str]) -> str:
         """Analyze survey responses and generate an action plan."""
@@ -186,7 +205,7 @@ class TextEditor:
             sections.append(f"【{fn}】\n{t}")
         combined = "\n\n---\n\n".join(sections)
         prompt = _SURVEY_ANALYSIS_PROMPT.format(combined=combined)
-        return self._call_gemini(prompt)
+        return self._call_gemini(prompt, purpose="アンケート分析")
 
     def check_text_quality(self, text: str) -> str:
         """Check pasted survey text for typos, awkward style, and unnatural Japanese.
@@ -197,43 +216,71 @@ class TextEditor:
         if not text or not text.strip():
             return "## 問題は検出されませんでした\n\n（入力テキストが空です）"
         prompt = _TEXT_QUALITY_CHECK_PROMPT.format(text=text)
-        return self._call_gemini(prompt)
+        return self._call_gemini(prompt, purpose="校正チェック")
 
-    def _call_gemini(self, prompt: str, max_retries: int = 3) -> str:
-        """Call Gemini API with exponential backoff retry on 5xx errors."""
+    def fix_text_quality(self, text: str) -> str:
+        """誤字脱字・違和感を全て修正した整形済みテキストを返す（差分プレビュー用）."""
+        if not text or not text.strip():
+            return ""
+        prompt = _TEXT_QUALITY_FIX_PROMPT.format(text=text)
+        return self._call_gemini(prompt, purpose="校正: 自動修正")
+
+    def call_with_purpose(self, prompt: str, purpose: str) -> str:
+        """汎用 Gemini 呼び出し（survey_analyzer などから利用）。"""
+        return self._call_gemini(prompt, purpose=purpose)
+
+    def _call_gemini(
+        self,
+        prompt: str,
+        max_retries: int = 3,
+        purpose: str = "テキスト処理",
+    ) -> str:
+        """Call Gemini API with exponential backoff retry on 5xx errors.
+
+        コスト・処理時間はモジュール cost_tracker に記録される。
+        """
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         last_err: Exception = RuntimeError("API呼び出しに失敗しました")
 
-        for attempt in range(max_retries):
-            try:
-                res = requests.post(
-                    f"{self.endpoint}?key={self.api_key}",
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    timeout=120,
-                )
-                res.raise_for_status()
-                return (
-                    res.json()
-                    .get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                ).strip()
-            except requests.HTTPError as e:
-                last_err = e
-                status = e.response.status_code if e.response is not None else 0
-                # Retry on 5xx (server-side) errors
-                if status >= 500 and attempt < max_retries - 1:
-                    wait = 2 ** attempt  # 1s → 2s → 4s
-                    time.sleep(wait)
-                    continue
-                raise
-            except Exception as e:
-                last_err = e
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise
+        with TimedCall(
+            purpose=purpose,
+            model=MODEL_NAME,
+            input_chars=len(prompt),
+        ) as tc:
+            for attempt in range(max_retries):
+                try:
+                    res = requests.post(
+                        f"{self.endpoint}?key={self.api_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=payload,
+                        timeout=120,
+                    )
+                    res.raise_for_status()
+                    text = (
+                        res.json()
+                        .get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                    ).strip()
+                    tc.set_output(text)
+                    return text
+                except requests.HTTPError as e:
+                    last_err = e
+                    status = e.response.status_code if e.response is not None else 0
+                    if status >= 500 and attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        time.sleep(wait)
+                        continue
+                    tc.mark_error(e)
+                    raise
+                except Exception as e:
+                    last_err = e
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    tc.mark_error(e)
+                    raise
 
-        raise last_err
+            tc.mark_error(last_err)
+            raise last_err

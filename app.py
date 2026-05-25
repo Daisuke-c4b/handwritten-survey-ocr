@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import io
 import tempfile
 from pathlib import Path
 
@@ -29,6 +30,10 @@ from utils import (
     extract_filename,
     get_supported_extensions_list,
 )
+import cost_tracker
+import survey_analyzer
+import excel_exporter
+from diff_viewer import generate_diff_html
 
 # ---------------------------------------------------------------------------
 # Session state helpers
@@ -44,6 +49,8 @@ _STATE_DEFAULTS: dict = {
     "survey_analysis": "",
     "proofread_input": "",
     "proofread_result": "",
+    "proofread_fixed_text": "",
+    "auto_template_candidates": [],
 }
 
 
@@ -327,6 +334,7 @@ def _render_proofread_section() -> None:
     if clear_clicked:
         st.session_state.proofread_input = ""
         st.session_state.proofread_result = ""
+        st.session_state.proofread_fixed_text = ""
         st.rerun()
 
     if run_clicked:
@@ -339,20 +347,47 @@ def _render_proofread_section() -> None:
                     result = editor.check_text_quality(
                         st.session_state.proofread_input
                     )
+                    fixed = editor.fix_text_quality(
+                        st.session_state.proofread_input
+                    )
                 st.session_state.proofread_result = result
+                st.session_state.proofread_fixed_text = fixed
                 st.rerun()
             except Exception as e:
                 st.error(f"校正エラー: {str(e)}")
 
     if st.session_state.proofread_result:
-        st.markdown("**校正結果**")
+        st.markdown("**校正結果（指摘レポート）**")
         st.markdown(st.session_state.proofread_result)
 
+        if st.session_state.proofread_fixed_text:
+            st.divider()
+            st.markdown("**🔄 修正前/修正後 の差分プレビュー**")
+            st.caption(
+                "Gemini が自動修正したテキストと原文の差分を表示します。"
+                "緑色が追加・赤色（取り消し線）が削除です。"
+            )
+            diff_html = generate_diff_html(
+                st.session_state.proofread_input,
+                st.session_state.proofread_fixed_text,
+            )
+            st.markdown(diff_html, unsafe_allow_html=True)
+
+            with st.expander("修正後テキスト（コピー用）", expanded=False):
+                st.text_area(
+                    "修正後テキスト",
+                    value=st.session_state.proofread_fixed_text,
+                    height=240,
+                    key="proofread_fixed_area",
+                    label_visibility="collapsed",
+                )
+
+        st.divider()
         st.caption("結果テキストをコピーしたい場合は以下のエリアから取得できます。")
         st.text_area(
             "校正結果（コピー用）",
             value=st.session_state.proofread_result,
-            height=200,
+            height=180,
             key="proofread_result_area",
             label_visibility="collapsed",
         )
@@ -432,19 +467,34 @@ def _process_files(uploaded_files: list) -> None:
             try:
                 with st.spinner(f"Gemini AI で文字起こし中: {uploaded_file.name}"):
                     if file_type == "pdf":
-                        transcription = ocr_processor.process_pdf(tmp_path)
+                        transcription, page_images = (
+                            ocr_processor.process_pdf_with_images(tmp_path)
+                        )
                     else:
-                        transcription = ocr_processor.process_image(tmp_path)
+                        transcription, page_images = (
+                            ocr_processor.process_image_with_images(tmp_path)
+                        )
 
                 if not transcription or transcription.strip() == "":
                     st.warning(f"⚠️ {uploaded_file.name}: 文字起こし結果が空です")
                     continue
+
+                # ページ画像を PNG バイト列にしてセッションへ格納（再実行に耐える）
+                page_image_bytes: list[tuple[bytes, int]] = []
+                for img, pnum in page_images:
+                    try:
+                        buf = io.BytesIO()
+                        img.save(buf, format="PNG")
+                        page_image_bytes.append((buf.getvalue(), pnum))
+                    except Exception:
+                        continue
 
                 st.session_state.processed_files.append(
                     {
                         "filename": uploaded_file.name,
                         "transcription": transcription,
                         "current_text": transcription,
+                        "page_images": page_image_bytes,
                     }
                 )
                 st.success(f"✅ {uploaded_file.name}: 処理完了")
@@ -459,6 +509,365 @@ def _process_files(uploaded_files: list) -> None:
     progress_bar.progress(1.0)
     status_text.text("すべての処理が完了しました！")
     st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Respondent view / Quant summary / Image comparison
+# ---------------------------------------------------------------------------
+
+def _render_respondent_view(idx: int, pf: dict) -> None:
+    """[P.N] でグルーピングした回答者単位ビュー."""
+    st.markdown("**👥 回答者単位ビュー**")
+    st.caption(
+        "[P.N] や [回答者N] の識別子を基準にグルーピングして、回答者ごとに縦読みします。"
+        "「質問ごとにまとめる」加工を先に実行しておくと識別子が確実に付与されます。"
+    )
+    parsed = survey_analyzer.parse_consolidated_text(pf["current_text"])
+    respondents = survey_analyzer.to_respondent_view(parsed)
+    if not respondents:
+        st.info(
+            "回答者識別子が検出できませんでした。"
+            "「質問ごとにまとめる」加工を実行してから再度開いてください。"
+        )
+        return
+
+    for block in respondents:
+        with st.expander(f"[{block.respondent_id}] の回答（{len(block.answers)} 件）", expanded=False):
+            for q_num, q_text, ans in block.answers:
+                st.markdown(f"- **Q{q_num}: {q_text}**")
+                st.markdown(f"  - {ans}")
+
+
+def _render_quant_summary(idx: int, pf: dict) -> None:
+    """センチメント分類・トピック・キーワードの定量サマリー."""
+    st.markdown("**📊 定量サマリー（センチメント・トピック・キーワード）**")
+    st.caption(
+        "現在のテキストを Gemini に解析させ、ポジ/ネガ/中立の件数、"
+        "トピック・キーワード・代表回答を JSON で返してもらいます。"
+    )
+
+    summary_key = "quant_summary"
+    col_run, col_clear = st.columns([3, 1])
+    with col_run:
+        if st.button(
+            "📈 定量サマリーを生成",
+            key=f"quant_btn_{idx}",
+            use_container_width=True,
+        ):
+            try:
+                editor = TextEditor()
+                with st.spinner("定量サマリーを生成中..."):
+                    summary = survey_analyzer.generate_quant_summary(
+                        pf["current_text"],
+                        caller=lambda p: editor.call_with_purpose(p, "定量サマリー"),
+                    )
+                pf[summary_key] = summary
+                st.rerun()
+            except Exception as e:
+                st.error(f"定量サマリー生成エラー: {str(e)}")
+    with col_clear:
+        if pf.get(summary_key):
+            if st.button("🗑️ クリア", key=f"quant_clear_{idx}", use_container_width=True):
+                pf[summary_key] = None
+                st.rerun()
+
+    summary = pf.get(summary_key)
+    if not summary:
+        return
+
+    if "_raw" in summary:
+        st.warning("JSON 解析に失敗しました。元応答を表示します。")
+        st.code(summary.get("_raw", ""))
+        return
+
+    sent = summary.get("sentiment", {}) or {}
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("回答数", summary.get("answer_count", 0))
+    col2.metric("ポジティブ", sent.get("positive", 0))
+    col3.metric("ネガティブ", sent.get("negative", 0))
+    col4.metric("中立", sent.get("neutral", 0))
+
+    topics = summary.get("topics", []) or []
+    if topics:
+        st.markdown("**トピック（多い順）**")
+        topic_rows = [
+            {
+                "トピック": t.get("label", ""),
+                "件数": t.get("count", 0),
+                "代表表現": " / ".join(t.get("examples", []) or []),
+            }
+            for t in topics
+        ]
+        st.dataframe(topic_rows, use_container_width=True, hide_index=True)
+        try:
+            chart_data = {t.get("label", f"トピック{i}"): t.get("count", 0) for i, t in enumerate(topics)}
+            st.bar_chart(chart_data)
+        except Exception:
+            pass
+
+    keywords = summary.get("keywords", []) or []
+    if keywords:
+        st.markdown("**頻出キーワード**")
+        st.dataframe(
+            [{"キーワード": k.get("word", ""), "出現数": k.get("count", 0)} for k in keywords],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    highlights = summary.get("highlights", {}) or {}
+    pos = highlights.get("positive", []) or []
+    neg = highlights.get("negative", []) or []
+    if pos or neg:
+        st.markdown("**代表的な回答**")
+        if pos:
+            st.markdown("- ポジティブ:")
+            for s in pos:
+                st.markdown(f"  - {s}")
+        if neg:
+            st.markdown("- ネガティブ:")
+            for s in neg:
+                st.markdown(f"  - {s}")
+
+
+def _render_image_comparison(idx: int, pf: dict) -> None:
+    """原画像との対比ビュー."""
+    st.markdown("**🖼️ 原画像との対比**")
+    page_images = pf.get("page_images") or []
+    if not page_images:
+        st.info("原画像が保持されていません（旧フォーマットの結果）。再アップロードで利用可能になります。")
+        return
+    st.caption("該当ページを選んで、OCRテキストと並べて確認できます。")
+
+    page_options = [pnum for _b, pnum in page_images]
+    selected = st.selectbox(
+        "表示するページ",
+        options=page_options,
+        index=0,
+        key=f"img_page_{idx}",
+    )
+
+    img_bytes = None
+    for b, pnum in page_images:
+        if pnum == selected:
+            img_bytes = b
+            break
+
+    if img_bytes is None:
+        st.warning("画像が見つかりませんでした。")
+        return
+
+    col_img, col_txt = st.columns([1, 1])
+    with col_img:
+        st.image(img_bytes, caption=f"ページ {selected}", use_container_width=True)
+    with col_txt:
+        st.markdown(f"**ページ {selected} の文字起こしテキスト**")
+        st.caption("[P.{selected}] 識別子を含む行を抽出して表示しています。".replace("{selected}", str(selected)))
+        snippet = _extract_page_snippet(pf["current_text"], selected)
+        st.text_area(
+            f"ページ {selected} 抜粋",
+            value=snippet,
+            height=320,
+            key=f"img_text_{idx}_{selected}",
+            label_visibility="collapsed",
+        )
+
+
+def _extract_page_snippet(text: str, page_num: int) -> str:
+    """集約済みテキストから [P.<page_num>] を含む行と質問見出しを抜粋."""
+    if not text:
+        return ""
+    needle = f"[P.{page_num}]"
+    lines = text.splitlines()
+    out: list[str] = []
+    current_q: str = ""
+    last_q_emitted = ""
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("Q") and ":" in s.split(" ", 1)[0] + ":":
+            current_q = s
+            continue
+        # Q ヘッダ簡易判定（質問/Q）
+        if s.startswith("質問") or (s.startswith("Q") and any(ch.isdigit() for ch in s[:4])):
+            current_q = s
+            continue
+        if needle in s:
+            if current_q and current_q != last_q_emitted:
+                if out:
+                    out.append("")
+                out.append(current_q)
+                last_q_emitted = current_q
+            out.append(s)
+    if not out:
+        return f"（ページ {page_num} に対応する [P.{page_num}] 行が見つかりませんでした。"  \
+               f"「質問ごとにまとめる」加工を実行してください。）"
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Cost / usage dashboard
+# ---------------------------------------------------------------------------
+
+def _render_cost_dashboard() -> None:
+    summary = cost_tracker.summary()
+    if summary["total_calls"] == 0:
+        st.caption("まだ API 呼び出しは行われていません。文字起こしや加工を実行すると統計が表示されます。")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("総呼び出し回数", summary["total_calls"])
+    col2.metric("処理時間 合計", f"{summary['total_duration_sec']:.1f} 秒")
+    col3.metric("失敗", summary["failed_calls"])
+    col4.metric("推定コスト (USD)", f"${summary['estimated_cost_usd']:.6f}")
+
+    col5, col6, col7 = st.columns(3)
+    col5.metric("入力文字数 合計", f"{summary['total_input_chars']:,}")
+    col6.metric("出力文字数 合計", f"{summary['total_output_chars']:,}")
+    col7.metric("1回あたり平均時間", f"{summary['average_duration_sec']:.1f} 秒")
+
+    per_purpose = cost_tracker.per_purpose_summary()
+    if per_purpose:
+        st.markdown("**目的別サマリー**")
+        rows = [
+            {
+                "用途": p["purpose"],
+                "回数": p["calls"],
+                "合計秒": f"{p['duration_sec']:.1f}",
+                "入力chars": p["input_chars"],
+                "出力chars": p["output_chars"],
+                "失敗": p["errors"],
+                "推定$": f"${p['estimated_cost_usd']:.6f}",
+            }
+            for p in per_purpose
+        ]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    with st.expander("直近の呼び出し履歴（最大50件）", expanded=False):
+        records = cost_tracker.recent_records(50)
+        if records:
+            display_rows = [
+                {
+                    "purpose": r["purpose"],
+                    "duration(s)": round(r["duration_sec"], 2),
+                    "input_chars": r["input_chars"],
+                    "output_chars": r["output_chars"],
+                    "image_bytes": r["image_bytes"],
+                    "status": r["status"],
+                }
+                for r in records
+            ]
+            st.dataframe(display_rows, use_container_width=True, hide_index=True)
+
+    st.caption(
+        f"※ コスト見積もりは入力 ${summary['input_price_per_1m_usd']}/1M tokens, "
+        f"出力 ${summary['output_price_per_1m_usd']}/1M tokens, "
+        f"日本語約 {summary['chars_per_token']} 文字/トークンの仮定で算出した目安値です。"
+    )
+
+    if st.button("🗑️ 集計をリセット", key="cost_reset"):
+        cost_tracker.reset()
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Auto-generate exclude template from uploaded files
+# ---------------------------------------------------------------------------
+
+def _render_auto_template_section() -> None:
+    """アップロード済みファイルの文字起こし結果から、除外テンプレート候補を自動生成."""
+    if not st.session_state.processed_files:
+        st.caption(
+            "ファイルをアップロードして文字起こしを実行すると、"
+            "印字テキストから除外テンプレート候補を自動抽出できます。"
+        )
+        return
+
+    st.caption(
+        "現在の処理結果から、印字された質問文・タイトル・案内文などを抽出して"
+        "「除外テキスト」候補として提示します。確認後、テンプレートとして保存できます。"
+    )
+
+    col_run, col_clear = st.columns([3, 1])
+    with col_run:
+        if st.button(
+            "🪄 アップロード結果から候補を抽出",
+            key="auto_tmpl_run",
+            use_container_width=True,
+            type="primary",
+        ):
+            try:
+                editor = TextEditor()
+                # 全ファイルの transcription を結合（current_text ではなく原文を優先）
+                combined = "\n\n---\n\n".join(
+                    f"【{pf['filename']}】\n{pf.get('transcription', '')}"
+                    for pf in st.session_state.processed_files
+                )
+                with st.spinner("テンプレート候補を抽出中..."):
+                    items = survey_analyzer.generate_exclude_template(
+                        combined,
+                        caller=lambda p: editor.call_with_purpose(p, "テンプレート自動生成"),
+                    )
+                st.session_state.auto_template_candidates = items
+                st.rerun()
+            except Exception as e:
+                st.error(f"抽出エラー: {str(e)}")
+    with col_clear:
+        if st.session_state.auto_template_candidates:
+            if st.button("🗑️ クリア", key="auto_tmpl_clear", use_container_width=True):
+                st.session_state.auto_template_candidates = []
+                st.rerun()
+
+    if not st.session_state.auto_template_candidates:
+        return
+
+    st.markdown(f"**抽出された候補（{len(st.session_state.auto_template_candidates)} 件）**")
+    edited_lines = st.text_area(
+        "抽出された候補（必要に応じて編集）",
+        value="\n".join(st.session_state.auto_template_candidates),
+        height=240,
+        key="auto_tmpl_edit",
+    )
+
+    col_apply, col_save = st.columns(2)
+    with col_apply:
+        if st.button(
+            "📝 現在の除外テキストに反映",
+            key="auto_tmpl_apply",
+            use_container_width=True,
+        ):
+            new_items = [l.strip() for l in edited_lines.splitlines() if l.strip()]
+            existing = {
+                l.strip() for l in st.session_state.exclude_texts.splitlines() if l.strip()
+            }
+            merged = list(existing) + [it for it in new_items if it not in existing]
+            st.session_state.exclude_texts = "\n".join(merged)
+            _invalidate_processor()
+            st.success(f"{len(new_items)} 件を除外テキストに反映しました。")
+
+    with col_save:
+        save_name = st.text_input(
+            "テンプレート名（任意）",
+            key="auto_tmpl_name",
+            placeholder="例: 自動生成_研修アンケート",
+        )
+        if st.button(
+            "💾 テンプレートとして保存",
+            key="auto_tmpl_save",
+            use_container_width=True,
+        ):
+            if not save_name.strip():
+                st.warning("テンプレート名を入力してください。")
+            else:
+                new_items = [l.strip() for l in edited_lines.splitlines() if l.strip()]
+                if not new_items:
+                    st.warning("候補が空です。")
+                else:
+                    try:
+                        add_template(save_name.strip(), new_items)
+                        st.success(f"テンプレート「{save_name.strip()}」を保存しました。")
+                    except ValueError as e:
+                        st.error(str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -564,23 +973,74 @@ def _render_results() -> None:
 
             st.divider()
 
+            # ---- Respondent view (per-respondent grouping) ----
+            _render_respondent_view(idx, pf)
+
+            st.divider()
+
+            # ---- Quantitative summary ----
+            _render_quant_summary(idx, pf)
+
+            st.divider()
+
+            # ---- Original image comparison ----
+            _render_image_comparison(idx, pf)
+
+            st.divider()
+
             # ---- Download ----
-            st.markdown("**📥 Word ダウンロード**")
-            st.caption("現在のテキスト（加工済みの場合は加工後）でファイルを生成します。")
-            try:
-                word_content = doc_generator.create_document(
-                    pf["current_text"], pf["filename"]
-                )
-                st.download_button(
-                    label="📥 Word ファイルをダウンロード",
-                    data=word_content,
-                    file_name=f"{extract_filename(pf['filename'])}_transcription.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                    key=f"download_{idx}",
-                )
-            except Exception as e:
-                st.error(f"Word 生成エラー: {str(e)}")
+            st.markdown("**📥 ダウンロード**")
+            st.caption(
+                "現在のテキスト（加工済みの場合は加工後）でファイルを生成します。"
+                "Word と Excel から選択できます。"
+            )
+            col_dl_w, col_dl_x = st.columns(2)
+            with col_dl_w:
+                try:
+                    word_content = doc_generator.create_document(
+                        pf["current_text"], pf["filename"]
+                    )
+                    st.download_button(
+                        label="📥 Word",
+                        data=word_content,
+                        file_name=f"{extract_filename(pf['filename'])}_transcription.docx",
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "wordprocessingml.document"
+                        ),
+                        use_container_width=True,
+                        key=f"download_{idx}",
+                    )
+                except Exception as e:
+                    st.error(f"Word 生成エラー: {str(e)}")
+            with col_dl_x:
+                try:
+                    parsed_q = survey_analyzer.parse_consolidated_text(pf["current_text"])
+                    respondents = survey_analyzer.to_respondent_view(parsed_q)
+                    quant = pf.get("quant_summary")
+                    excel_bytes = excel_exporter.build_workbook(
+                        questions=parsed_q,
+                        respondents=respondents,
+                        quant_summary=quant,
+                        source_filename=pf["filename"],
+                    )
+                    st.download_button(
+                        label="📥 Excel",
+                        data=excel_bytes,
+                        file_name=f"{extract_filename(pf['filename'])}_transcription.xlsx",
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "spreadsheetml.sheet"
+                        ),
+                        use_container_width=True,
+                        key=f"download_xlsx_{idx}",
+                    )
+                except Exception as e:
+                    st.warning(
+                        "Excel を生成するには、まず「質問ごとにまとめる」加工で"
+                        "[P.N] 識別子付きテキストにしてください。"
+                    )
+                    st.caption(f"内部エラー: {e}")
 
     # ---- Survey analysis ----
     st.divider()
@@ -732,6 +1192,18 @@ def main():
     st.subheader("📝 文字校正チェック（コピペ）")
     with st.expander("テキストを貼り付けて誤字脱字・違和感をチェックする", expanded=False):
         _render_proofread_section()
+
+    # ---- Auto-generate exclude template ----
+    st.divider()
+    st.subheader("🪄 設問テンプレートの自動生成")
+    with st.expander("アップロード結果から除外テンプレートを抽出する", expanded=False):
+        _render_auto_template_section()
+
+    # ---- API cost / time dashboard ----
+    st.divider()
+    st.subheader("💰 API 利用状況・処理時間")
+    with st.expander("呼び出し回数・処理時間・推定コストを見る", expanded=False):
+        _render_cost_dashboard()
 
 
 if __name__ == "__main__":

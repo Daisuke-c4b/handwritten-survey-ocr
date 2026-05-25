@@ -4,10 +4,13 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageEnhance, ImageFilter
 import io
 import os
+import re
 import base64
 import numpy as np
 
-APP_VERSION = "1.4.0"
+from cost_tracker import TimedCall
+
+APP_VERSION = "1.5.0"
 APP_UPDATED = "2026-05-25"
 
 MODEL_NAME = "gemini-3.1-flash-lite-preview"
@@ -18,6 +21,20 @@ MODEL_DESCRIPTION = (
 )
 
 CHANGELOG: list[dict] = [
+    {
+        "version": "1.5.0",
+        "date": "2026-05-25",
+        "changes": [
+            "複数ページPDF集約のバグ修正: ページごとに印字質問の認識が欠落しても、他ページから取得した canonical な質問文と Gemini による再割り当てで正しい質問の下に回答を集約",
+            "回答者単位ビュー: [P.N] 識別子でグルーピングし、誰がどの質問にどう答えたかを縦読み可能に",
+            "定量サマリー: センチメント分類・トピック抽出・キーワード頻度を JSON で取得し、可視化表示",
+            "設問テンプレート自動生成: アップロード済みファイルから印字テキストを抽出し除外テンプレートを提案",
+            "原画像との対比ビュー: 各ページ画像を保持し、文字起こしと並べて確認可能",
+            "校正の差分プレビュー: 自動修正後テキストと原文の差分を色付き HTML で表示",
+            "Excel 出力: 質問別シート・回答者別マトリクス・定量サマリーを 1 ファイルで",
+            "API コスト・処理時間の可視化: 全 Gemini 呼び出しを集計し、目的別・累計サマリーを表示",
+        ],
+    },
     {
         "version": "1.4.0",
         "date": "2026-05-25",
@@ -115,20 +132,31 @@ def extract_texts_from_screenshots(image_bytes_list: list[bytes]) -> list[str]:
                     ]
                 }]
             }
-            res = requests.post(
-                f"{endpoint}?key={api_key}",
-                headers={"Content-Type": "application/json"},
-                json=payload,
-                timeout=60,
-            )
-            res.raise_for_status()
-            text = (
-                res.json()
-                .get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "")
-            )
+            with TimedCall(
+                purpose="除外テキスト抽出",
+                model=MODEL_NAME,
+                input_chars=len(prompt),
+                image_bytes=len(img_bytes),
+            ) as tc:
+                try:
+                    res = requests.post(
+                        f"{endpoint}?key={api_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=payload,
+                        timeout=60,
+                    )
+                    res.raise_for_status()
+                    text = (
+                        res.json()
+                        .get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                    )
+                    tc.set_output(text or "")
+                except Exception as _e_cost:
+                    tc.mark_error(_e_cost)
+                    raise
             for line in text.strip().splitlines():
                 line = line.strip()
                 if line:
@@ -264,85 +292,111 @@ class OCRProcessor:
 """
 
     def process_pdf(self, pdf_path):
-        """Process PDF file and extract handwritten Japanese text using Gemini AI"""
+        """Process PDF file and extract handwritten Japanese text using Gemini AI.
+
+        テキストのみ返す。原画像が必要な場合は process_pdf_with_images() を使う。
+        """
+        text, _images = self.process_pdf_with_images(pdf_path)
+        return text
+
+    def process_pdf_with_images(self, pdf_path):
+        """PDF 処理を行い、文字起こしテキストと各ページの PIL 画像リストを返す.
+
+        Returns:
+            (text, [(pil_image, page_num), ...])
+        """
         try:
-            # Open PDF
             pdf_document = fitz.open(pdf_path)
             all_images = []
-            
-            # First, collect all page images
+            original_images = []
+
             for page_num in range(len(pdf_document)):
                 page = pdf_document.load_page(page_num)
-                
-                # Convert page to image with maximum resolution
-                mat = fitz.Matrix(6.0, 6.0)  # Maximum resolution for best OCR
+
+                mat = fitz.Matrix(6.0, 6.0)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 img_data = pix.tobytes("png")
-                
-                # Convert to PIL Image and apply multiple enhancement techniques
-                image = Image.open(io.BytesIO(img_data))
-                
-                # Apply advanced image enhancement for maximum OCR accuracy
-                image = self._enhance_image_for_ocr(image)
+
+                raw_image = Image.open(io.BytesIO(img_data))
+                # オリジナル画像は対比ビュー用に別途保持（軽い縮小版）
+                original_images.append((self._make_preview_image(raw_image), page_num + 1))
+
+                image = self._enhance_image_for_ocr(raw_image.copy())
                 image = self._apply_additional_preprocessing(image)
-                
+
                 all_images.append((image, page_num + 1))
-            
+
             pdf_document.close()
-            
-            # Try individual processing first, fallback to batch if needed
+
             try:
                 final_text = self._process_pages_individually(all_images)
             except Exception as e:
                 print(f"Individual processing failed, trying batch processing: {e}")
                 final_text = self._extract_text_from_all_images(all_images)
-            
-            # Post-process the text
+
             final_text = self._post_process_text(final_text)
-            
-            return final_text
-            
+
+            return final_text, original_images
+
         except Exception as e:
             raise Exception(f"PDF処理エラー: {str(e)}")
     
     def process_image(self, image_path):
-        """Process image file (PNG, JPG, etc.) and extract handwritten Japanese text using Gemini AI"""
+        """Process image file (PNG, JPG, etc.) and extract handwritten Japanese text using Gemini AI."""
+        text, _images = self.process_image_with_images(image_path)
+        return text
+
+    def process_image_with_images(self, image_path):
+        """単一画像の処理結果（テキスト, 画像リスト）を返す."""
         try:
-            # Open image file
             image = Image.open(image_path)
-            
-            # Convert to RGB if necessary (handle RGBA, P mode, etc.)
-            if image.mode in ('RGBA', 'P', 'LA'):
-                # Create white background for transparent images
-                background = Image.new('RGB', image.size, (255, 255, 255))
-                if image.mode == 'P':
-                    image = image.convert('RGBA')
-                background.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
+
+            if image.mode in ("RGBA", "P", "LA"):
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                if image.mode == "P":
+                    image = image.convert("RGBA")
+                background.paste(
+                    image,
+                    mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None,
+                )
                 image = background
-            elif image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            # Apply image enhancement for OCR
-            image = self._enhance_image_for_ocr(image)
-            image = self._apply_additional_preprocessing(image)
-            
-            # Process as single image
-            all_images = [(image, 1)]
-            
-            # Try individual processing
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+
+            preview = self._make_preview_image(image)
+
+            enhanced = self._enhance_image_for_ocr(image.copy())
+            enhanced = self._apply_additional_preprocessing(enhanced)
+
+            all_images = [(enhanced, 1)]
+            original_images = [(preview, 1)]
+
             try:
                 final_text = self._process_pages_individually(all_images)
             except Exception as e:
                 print(f"Individual processing failed, trying batch processing: {e}")
                 final_text = self._extract_text_from_all_images(all_images)
-            
-            # Post-process the text
+
             final_text = self._post_process_text(final_text)
-            
-            return final_text
-            
+
+            return final_text, original_images
+
         except Exception as e:
             raise Exception(f"画像処理エラー: {str(e)}")
+
+    def _make_preview_image(self, image, max_dim: int = 1400):
+        """対比ビュー表示用に元画像の縮小コピーを作る."""
+        try:
+            img = image.copy()
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            w, h = img.size
+            if max(w, h) > max_dim:
+                scale = max_dim / max(w, h)
+                img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+            return img
+        except Exception:
+            return image
     
     def process_images(self, image_paths):
         """Process multiple image files and extract handwritten Japanese text using Gemini AI"""
@@ -591,18 +645,32 @@ class OCRProcessor:
                 }
                 
                 print(f"ページ {page_num}: Gemini API呼び出し中...")
-                res = requests.post(
-                    f"{self.endpoint}?key={self.api_key}",
-                    headers=headers,
-                    json=payload,
-                    timeout=180
-                )
-                
-                # Check response status
-                print(f"ページ {page_num}: APIレスポンス status={res.status_code}")
-                
-                res.raise_for_status()
-                data = res.json()
+                with TimedCall(
+                    purpose=f"OCR: 個別ページ (P.{page_num})",
+                    model=self.model_name,
+                    input_chars=len(self.ocr_prompt),
+                    image_bytes=len(img_byte_arr),
+                ) as tc:
+                    try:
+                        res = requests.post(
+                            f"{self.endpoint}?key={self.api_key}",
+                            headers=headers,
+                            json=payload,
+                            timeout=180
+                        )
+                        print(f"ページ {page_num}: APIレスポンス status={res.status_code}")
+                        res.raise_for_status()
+                        data = res.json()
+                        _resp_text_for_cost = (
+                            data.get("candidates", [{}])[0]
+                            .get("content", {})
+                            .get("parts", [{}])[0]
+                            .get("text", "")
+                        )
+                        tc.set_output(_resp_text_for_cost)
+                    except Exception as _e_cost:
+                        tc.mark_error(_e_cost)
+                        raise
                 
                 # Debug: print response structure
                 if "error" in data:
@@ -693,20 +761,35 @@ class OCRProcessor:
                         }
                     })
             payload = {"contents": [{"parts": parts}]}
-            res = requests.post(
-                f"{self.endpoint}?key={self.api_key}",
-                headers={"Content-Type": "application/json"},
-                json=payload,
-                timeout=300
+            total_img_bytes = sum(
+                len(p.get("inline_data", {}).get("data", "")) for p in parts
+                if isinstance(p, dict) and "inline_data" in p
             )
-            res.raise_for_status()
-            data = res.json()
-            text = (
-                data.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "")
-            )
+            with TimedCall(
+                purpose="OCR: 複数ページ一括",
+                model=self.model_name,
+                input_chars=len(multi_prompt),
+                image_bytes=total_img_bytes,
+            ) as tc:
+                try:
+                    res = requests.post(
+                        f"{self.endpoint}?key={self.api_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=payload,
+                        timeout=300
+                    )
+                    res.raise_for_status()
+                    data = res.json()
+                    text = (
+                        data.get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                    )
+                    tc.set_output(text or "")
+                except Exception as _e_cost:
+                    tc.mark_error(_e_cost)
+                    raise
             if text:
                 return text.strip()
             else:
@@ -811,20 +894,31 @@ class OCRProcessor:
                         }
                     ]
                 }
-                res = requests.post(
-                    f"{self.endpoint}?key={self.api_key}",
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    timeout=120
-                )
-                res.raise_for_status()
-                data = res.json()
-                current_result = (
-                    data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                ).strip()
+                with TimedCall(
+                    purpose=f"OCR: 拡張プロンプト (P.{page_num})",
+                    model=self.model_name,
+                    input_chars=len(individual_prompt),
+                    image_bytes=len(img_byte_arr),
+                ) as tc:
+                    try:
+                        res = requests.post(
+                            f"{self.endpoint}?key={self.api_key}",
+                            headers={"Content-Type": "application/json"},
+                            json=payload,
+                            timeout=120
+                        )
+                        res.raise_for_status()
+                        data = res.json()
+                        current_result = (
+                            data.get("candidates", [{}])[0]
+                            .get("content", {})
+                            .get("parts", [{}])[0]
+                            .get("text", "")
+                        ).strip()
+                        tc.set_output(current_result)
+                    except Exception as _e_cost:
+                        tc.mark_error(_e_cost)
+                        raise
                 
                 if current_result and self._is_text_valid(current_result):
                     # Found valid result
@@ -857,50 +951,241 @@ class OCRProcessor:
     def _consolidate_questions_from_pages(self, page_results):
         """Consolidate questions and answers from multiple pages.
 
-        各回答には [P.N] のページ識別子を付与し、同一回答者の追跡を可能にする。
+        改良ポイント (v1.5.0):
+        - 各ページのローカルパースで質問が一部欠落していた場合、
+          他ページから取得した canonical 質問文を使い Gemini に再割り当てを依頼する。
+        - 結果として、印字質問の OCR が失敗したページの回答も正しい質問にまとめられる。
+        - 各回答には [P.N] のページ識別子を付与し、同一回答者の追跡を可能にする。
         """
         if not page_results:
             return ""
 
-        questions_dict: dict[int, dict] = {}
-        raw_texts: list[str] = []
-
+        # --- 1) 各ページをローカルパース ---
+        parsed_pages: list[dict] = []
         for page_result in page_results:
             page_num = page_result['page_num']
-            text = page_result['text']
-
-            if text and text.strip():
-                raw_texts.append(f"--- ページ {page_num} ---\n{text}")
-
+            text = page_result['text'] or ""
             questions = self._parse_questions_from_text(text)
+            parsed_pages.append({
+                'page_num': page_num,
+                'raw_text': text,
+                'questions': questions,
+            })
 
-            for q_num, q_text, answer in questions:
-                if q_num not in questions_dict:
-                    questions_dict[q_num] = {
-                        'question': q_text,
-                        'answers': []
-                    }
+        # --- 2) canonical 質問文を集約（最長表記を採用）---
+        canonical_questions: dict[int, str] = {}
+        for pp in parsed_pages:
+            for q_num, q_text, _ in pp['questions']:
+                existing = canonical_questions.get(q_num, "")
+                if not existing or len(q_text) > len(existing):
+                    canonical_questions[q_num] = q_text
 
-                if answer and answer.strip() and answer.strip() not in ['（無回答）', '']:
+        # canonical が無ければ最低限のフォールバック
+        if not canonical_questions:
+            raw_texts = [
+                f"--- ページ {pp['page_num']} ---\n{pp['raw_text']}"
+                for pp in parsed_pages
+                if pp['raw_text'].strip()
+            ]
+            return "\n\n".join(raw_texts)
+
+        # --- 3) 質問辞書を canonical で初期化 ---
+        questions_dict: dict[int, dict] = {
+            q_num: {'question': q_text, 'answers': []}
+            for q_num, q_text in canonical_questions.items()
+        }
+
+        # --- 4) ローカルパースで取得済みの回答を投入 ---
+        pages_needing_reassignment: list[tuple[int, str, list[int]]] = []
+        for pp in parsed_pages:
+            page_num = pp['page_num']
+            raw_text = pp['raw_text']
+            page_q_nums = set()
+            for q_num, _q_text, answer in pp['questions']:
+                page_q_nums.add(q_num)
+                if answer and answer.strip() and answer.strip() != '（無回答）':
                     questions_dict[q_num]['answers'].append({
                         'page': page_num,
                         'text': answer.strip(),
                     })
 
-        if not questions_dict:
-            return "\n\n".join(raw_texts) if raw_texts else ""
+            # このページが canonical 全質問をカバーしていない & テキストが残っていれば
+            # 再割り当て対象に積む（小さな PDF や OCR が全質問を取れていれば不要）
+            missing = [
+                q_num
+                for q_num in canonical_questions
+                if q_num not in page_q_nums
+            ]
+            if missing and raw_text.strip() and self._has_answer_like_content(raw_text):
+                pages_needing_reassignment.append((page_num, raw_text, missing))
 
+        # --- 5) Gemini に再割り当てを依頼 ---
+        if len(canonical_questions) > 1 and pages_needing_reassignment:
+            for page_num, raw_text, missing in pages_needing_reassignment:
+                assignments = self._reassign_page_to_canonical(
+                    page_text=raw_text,
+                    canonical_questions=canonical_questions,
+                    target_q_nums=missing,
+                    page_num=page_num,
+                )
+                for q_num, answer in assignments:
+                    if not answer or not answer.strip():
+                        continue
+                    if answer.strip() == '（無回答）':
+                        continue
+                    # 既に同一テキストが入っていれば重複を避ける
+                    existing_texts = {
+                        a['text'] for a in questions_dict[q_num]['answers']
+                        if a['page'] == page_num
+                    }
+                    if answer.strip() in existing_texts:
+                        continue
+                    questions_dict[q_num]['answers'].append({
+                        'page': page_num,
+                        'text': answer.strip(),
+                    })
+
+        # --- 6) 出力組み立て ---
         result_lines: list[str] = []
         for q_num in sorted(questions_dict.keys()):
             q_data = questions_dict[q_num]
             result_lines.append(f"Q{q_num}: {q_data['question']}")
-
-            for ans in q_data['answers']:
-                result_lines.append(f"・[P.{ans['page']}] {ans['text']}")
-
+            if q_data['answers']:
+                for ans in sorted(q_data['answers'], key=lambda a: a['page']):
+                    result_lines.append(f"・[P.{ans['page']}] {ans['text']}")
+            else:
+                result_lines.append("・（無回答）")
             result_lines.append("")
 
         return "\n".join(result_lines)
+
+    def _has_answer_like_content(self, text: str) -> bool:
+        """質問ヘッダ以外に回答らしき行が含まれているか判定."""
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if re.match(r'^Q\d+\s*[:：]', s):
+                continue
+            if s.startswith('---'):
+                continue
+            if s.startswith('【'):
+                continue
+            return True
+        return False
+
+    def _reassign_page_to_canonical(
+        self,
+        page_text: str,
+        canonical_questions: dict[int, str],
+        target_q_nums: list[int],
+        page_num: int,
+    ) -> list[tuple[int, str]]:
+        """canonical 質問リストを基に、ページのテキストから対象質問への回答を Gemini に抽出させる."""
+        if not target_q_nums:
+            return []
+
+        all_q_text = "\n".join(
+            f"Q{q_num}: {canonical_questions[q_num]}"
+            for q_num in sorted(canonical_questions.keys())
+        )
+        target_q_text = "\n".join(
+            f"Q{q_num}: {canonical_questions[q_num]}"
+            for q_num in sorted(target_q_nums)
+        )
+
+        prompt = f"""\
+あなたはアンケート集約の専門家です。
+以下のページ（ページ{page_num}）のOCRテキストから、各質問への回答を抽出してください。
+このページでは印字された質問文の OCR 認識が一部欠落しているため、
+他ページから取得した canonical な質問文一覧を参照して回答を正しく分類してください。
+
+【canonical 質問一覧（参考用）】
+{all_q_text}
+
+【このページで抽出してほしい質問】
+{target_q_text}
+
+【出力形式（厳守）】
+Q<番号>: <該当する回答テキスト1行のみ>
+Q<番号>: <該当する回答テキスト1行のみ>
+...
+
+- 1 つの質問に対する複数行の回答は半角スペース区切りで 1 行にまとめてください。
+- 該当する回答が見つからない質問は出力しないでください（行をスキップ）。
+- 回答が手書きで存在しない・空欄である場合も出力しないでください。
+- 余計な前置き・注釈・Markdown 記号は禁止です。
+- 質問文や印字テキストを回答として出力してはいけません（手書きの内容のみ）。
+
+【ページ{page_num} の OCR テキスト】
+{page_text}
+"""
+        try:
+            response_text = self._call_gemini_text(
+                prompt=prompt,
+                purpose=f"OCR: 再割当て (P.{page_num})",
+                timeout=90,
+            )
+        except Exception as e:
+            print(f"_reassign_page_to_canonical page {page_num} failed: {e}")
+            return []
+
+        return self._parse_qnum_assignments(response_text, target_q_nums)
+
+    def _parse_qnum_assignments(
+        self,
+        text: str,
+        target_q_nums: list[int],
+    ) -> list[tuple[int, str]]:
+        """`Q1: 回答` 形式の応答を (q_num, answer) のリストに変換."""
+        results: list[tuple[int, str]] = []
+        target_set = set(target_q_nums)
+        for line in (text or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            m = re.match(r'^Q\s*(\d+)\s*[:：]\s*(.+)$', s)
+            if not m:
+                continue
+            q_num = int(m.group(1))
+            ans = m.group(2).strip()
+            if q_num in target_set and ans:
+                results.append((q_num, ans))
+        return results
+
+    def _call_gemini_text(
+        self,
+        prompt: str,
+        purpose: str = "OCR補助",
+        timeout: int = 120,
+    ) -> str:
+        """テキストのみの軽量 Gemini 呼び出し（コスト記録あり）."""
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        with TimedCall(
+            purpose=purpose,
+            model=self.model_name,
+            input_chars=len(prompt),
+        ) as tc:
+            try:
+                res = requests.post(
+                    f"{self.endpoint}?key={self.api_key}",
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                    timeout=timeout,
+                )
+                res.raise_for_status()
+                text = (
+                    res.json()
+                    .get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                ).strip()
+                tc.set_output(text)
+                return text
+            except Exception as e:
+                tc.mark_error(e)
+                raise
     
     def _parse_questions_from_text(self, text):
         """Parse questions and answers from text"""
