@@ -4,6 +4,9 @@ import io
 import tempfile
 from pathlib import Path
 
+import altair as alt
+import pandas as pd
+
 from ocr_processor import (
     OCRProcessor,
     extract_texts_from_screenshots,
@@ -34,6 +37,128 @@ import cost_tracker
 import survey_analyzer
 import excel_exporter
 from diff_viewer import generate_diff_html
+
+# ---------------------------------------------------------------------------
+# Theme / visual constants
+# ---------------------------------------------------------------------------
+
+_COLOR_POSITIVE = "#22c55e"
+_COLOR_NEGATIVE = "#ef4444"
+_COLOR_NEUTRAL = "#94a3b8"
+_COLOR_PRIMARY = "#3b82f6"
+_COLOR_ACCENT = "#10b981"
+_COLOR_WARNING = "#f59e0b"
+
+_GLOBAL_CSS = """
+<style>
+/* メインコンテナを十分広く */
+.block-container {
+    padding-top: 1.6rem;
+    padding-bottom: 4rem;
+    padding-left: 2.2rem;
+    padding-right: 2.2rem;
+    max-width: 1600px;
+}
+/* サイドバー幅を少し広めに固定 */
+section[data-testid="stSidebar"] {
+    width: 360px !important;
+    min-width: 360px !important;
+    max-width: 420px !important;
+    background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+}
+section[data-testid="stSidebar"] .block-container {
+    padding: 1.5rem 1rem 2rem 1rem;
+}
+/* タブを少し大きめに */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 4px;
+    border-bottom: 2px solid #e5e7eb;
+}
+.stTabs [data-baseweb="tab"] {
+    height: 44px;
+    padding: 0 18px;
+    font-weight: 500;
+    border-radius: 8px 8px 0 0;
+}
+.stTabs [aria-selected="true"] {
+    background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
+    color: #1d4ed8;
+    border-bottom: 3px solid #3b82f6;
+}
+/* エキスパンダ */
+[data-testid="stExpander"] {
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    background: #ffffff;
+}
+/* メトリクス */
+[data-testid="stMetric"] {
+    background: linear-gradient(135deg, #f8fafc 0%, #ffffff 100%);
+    padding: 14px 18px;
+    border-radius: 10px;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+}
+/* ボタンの強調 */
+.stButton button[kind="primary"] {
+    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+    border: none;
+    box-shadow: 0 2px 4px rgba(59,130,246,0.25);
+}
+.stButton button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+}
+/* ファイル結果のヘッダ */
+.file-card-header {
+    background: linear-gradient(135deg, #f8fafc 0%, #ffffff 100%);
+    padding: 12px 16px;
+    border-radius: 8px;
+    border-left: 4px solid #3b82f6;
+    margin-bottom: 12px;
+    font-weight: 600;
+}
+/* メトリクスカード（カスタム） */
+.metric-card {
+    padding: 16px 18px;
+    border-radius: 10px;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    background: #ffffff;
+}
+.metric-card .label {
+    font-size: 0.8rem;
+    color: #64748b;
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+.metric-card .value {
+    font-size: 1.9rem;
+    font-weight: 700;
+    line-height: 1.1;
+}
+.metric-card .sub {
+    font-size: 0.85rem;
+    color: #94a3b8;
+    margin-top: 4px;
+}
+</style>
+"""
+
+
+def _inject_global_css() -> None:
+    st.markdown(_GLOBAL_CSS, unsafe_allow_html=True)
+
+
+def _metric_card(label: str, value, sub: str = "", color: str = _COLOR_PRIMARY) -> str:
+    """カラーアクセント付きのメトリクスカード HTML を返す."""
+    return (
+        f'<div class="metric-card" style="border-left: 4px solid {color};">'
+        f'<div class="label">{label}</div>'
+        f'<div class="value" style="color: {color};">{value}</div>'
+        f'<div class="sub">{sub}</div>'
+        f'</div>'
+    )
 
 # ---------------------------------------------------------------------------
 # Session state helpers
@@ -69,7 +194,7 @@ def _invalidate_processor() -> None:
 # ---------------------------------------------------------------------------
 
 def _render_ocr_mode_section() -> None:
-    st.subheader("⚙️ 文字起こしモード")
+    st.caption("画像の読み取り方を選択します。")
 
     mode = st.radio(
         "文字起こしモード",
@@ -79,7 +204,7 @@ def _render_ocr_mode_section() -> None:
             "proofread": "🔍 校正文字起こし",
         }[x],
         index=0 if st.session_state.ocr_mode == "accurate" else 1,
-        horizontal=True,
+        horizontal=False,
         key="ocr_mode_radio",
         label_visibility="collapsed",
     )
@@ -516,7 +641,7 @@ def _process_files(uploaded_files: list) -> None:
 # ---------------------------------------------------------------------------
 
 def _render_respondent_view(idx: int, pf: dict) -> None:
-    """[P.N] でグルーピングした回答者単位ビュー."""
+    """[P.N] でグルーピングした回答者単位ビュー（カード型・複数カラム）."""
     st.markdown("**👥 回答者単位ビュー**")
     st.caption(
         "[P.N] や [回答者N] の識別子を基準にグルーピングして、回答者ごとに縦読みします。"
@@ -527,32 +652,67 @@ def _render_respondent_view(idx: int, pf: dict) -> None:
     if not respondents:
         st.info(
             "回答者識別子が検出できませんでした。"
-            "「質問ごとにまとめる」加工を実行してから再度開いてください。"
+            "「✏️ 編集・加工」タブで「質問ごとにまとめる」を実行してから再度ご確認ください。"
         )
         return
 
-    for block in respondents:
-        with st.expander(f"[{block.respondent_id}] の回答（{len(block.answers)} 件）", expanded=False):
-            for q_num, q_text, ans in block.answers:
-                st.markdown(f"- **Q{q_num}: {q_text}**")
-                st.markdown(f"  - {ans}")
+    # サマリーチップ
+    total_answers = sum(len(b.answers) for b in respondents)
+    st.markdown(
+        f'<div style="margin: 8px 0 16px 0;">'
+        f'<span style="background:{_COLOR_PRIMARY}15;color:{_COLOR_PRIMARY};'
+        f'padding:6px 12px;border-radius:14px;font-size:0.85rem;margin-right:6px;">'
+        f'👥 {len(respondents)} 名の回答者</span>'
+        f'<span style="background:{_COLOR_ACCENT}15;color:{_COLOR_ACCENT};'
+        f'padding:6px 12px;border-radius:14px;font-size:0.85rem;">'
+        f'💬 {total_answers} 件の回答</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ワイドレイアウトを活かして 2 列でカード表示
+    cols = st.columns(2, gap="large")
+    for i, block in enumerate(respondents):
+        with cols[i % 2]:
+            with st.container(border=True):
+                st.markdown(
+                    f'<div style="font-weight:600;color:{_COLOR_PRIMARY};margin-bottom:6px;">'
+                    f'[{block.respondent_id}]'
+                    f'<span style="color:#94a3b8;font-weight:400;font-size:0.85rem;margin-left:8px;">'
+                    f'回答数 {len(block.answers)}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                for q_num, q_text, ans in block.answers:
+                    st.markdown(
+                        f'<div style="margin: 8px 0 4px 0;">'
+                        f'<span style="background:#eff6ff;color:{_COLOR_PRIMARY};'
+                        f'padding:2px 8px;border-radius:6px;font-size:0.8rem;font-weight:600;'
+                        f'margin-right:6px;">Q{q_num}</span>'
+                        f'<span style="font-size:0.85rem;color:#475569;">{q_text}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{ans}", unsafe_allow_html=True)
 
 
 def _render_quant_summary(idx: int, pf: dict) -> None:
-    """センチメント分類・トピック・キーワードの定量サマリー."""
-    st.markdown("**📊 定量サマリー（センチメント・トピック・キーワード）**")
+    """センチメント分類・トピック・キーワードの定量サマリー（altair でスタイリッシュ化）."""
+    summary_key = "quant_summary"
+
+    st.markdown("**📊 定量サマリー**")
     st.caption(
-        "現在のテキストを Gemini に解析させ、ポジ/ネガ/中立の件数、"
-        "トピック・キーワード・代表回答を JSON で返してもらいます。"
+        "現在のテキストを Gemini に解析させ、センチメント・トピック・キーワード・"
+        "代表回答を JSON で取得し、視覚化します。"
     )
 
-    summary_key = "quant_summary"
-    col_run, col_clear = st.columns([3, 1])
+    col_run, col_clear, _ = st.columns([2, 1, 3])
     with col_run:
         if st.button(
             "📈 定量サマリーを生成",
             key=f"quant_btn_{idx}",
             use_container_width=True,
+            type="primary",
         ):
             try:
                 editor = TextEditor()
@@ -573,6 +733,7 @@ def _render_quant_summary(idx: int, pf: dict) -> None:
 
     summary = pf.get(summary_key)
     if not summary:
+        st.info("「定量サマリーを生成」を押すと、ここに結果が表示されます。")
         return
 
     if "_raw" in summary:
@@ -581,70 +742,213 @@ def _render_quant_summary(idx: int, pf: dict) -> None:
         return
 
     sent = summary.get("sentiment", {}) or {}
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("回答数", summary.get("answer_count", 0))
-    col2.metric("ポジティブ", sent.get("positive", 0))
-    col3.metric("ネガティブ", sent.get("negative", 0))
-    col4.metric("中立", sent.get("neutral", 0))
+    pos = int(sent.get("positive", 0))
+    neg = int(sent.get("negative", 0))
+    neu = int(sent.get("neutral", 0))
+    total = max(1, pos + neg + neu)
+    answer_count = summary.get("answer_count", pos + neg + neu)
 
-    topics = summary.get("topics", []) or []
-    if topics:
-        st.markdown("**トピック（多い順）**")
-        topic_rows = [
-            {
-                "トピック": t.get("label", ""),
-                "件数": t.get("count", 0),
-                "代表表現": " / ".join(t.get("examples", []) or []),
-            }
-            for t in topics
-        ]
-        st.dataframe(topic_rows, use_container_width=True, hide_index=True)
-        try:
-            chart_data = {t.get("label", f"トピック{i}"): t.get("count", 0) for i, t in enumerate(topics)}
-            st.bar_chart(chart_data)
-        except Exception:
-            pass
-
-    keywords = summary.get("keywords", []) or []
-    if keywords:
-        st.markdown("**頻出キーワード**")
-        st.dataframe(
-            [{"キーワード": k.get("word", ""), "出現数": k.get("count", 0)} for k in keywords],
-            use_container_width=True,
-            hide_index=True,
+    # ---- メトリクスカード ----
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(_metric_card("回答数", f"{answer_count}", color="#0f172a"), unsafe_allow_html=True)
+    with c2:
+        st.markdown(
+            _metric_card("ポジティブ", f"{pos}", sub=f"{pos / total * 100:.0f}%", color=_COLOR_POSITIVE),
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            _metric_card("ネガティブ", f"{neg}", sub=f"{neg / total * 100:.0f}%", color=_COLOR_NEGATIVE),
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            _metric_card("中立", f"{neu}", sub=f"{neu / total * 100:.0f}%", color=_COLOR_NEUTRAL),
+            unsafe_allow_html=True,
         )
 
+    st.markdown('<div style="margin-top: 16px;"></div>', unsafe_allow_html=True)
+
+    # ---- 2列構成: 左=ドーナツチャート、右=トピック横棒 ----
+    col_sent, col_topic = st.columns([2, 3], gap="large")
+
+    with col_sent:
+        st.markdown("**センチメント分布**")
+        if pos + neg + neu > 0:
+            sent_df = pd.DataFrame(
+                [
+                    {"label": "ポジティブ", "count": pos},
+                    {"label": "ネガティブ", "count": neg},
+                    {"label": "中立", "count": neu},
+                ]
+            )
+            sent_chart = (
+                alt.Chart(sent_df)
+                .mark_arc(innerRadius=58, outerRadius=110, stroke="#fff", strokeWidth=2)
+                .encode(
+                    theta=alt.Theta("count:Q"),
+                    color=alt.Color(
+                        "label:N",
+                        scale=alt.Scale(
+                            domain=["ポジティブ", "ネガティブ", "中立"],
+                            range=[_COLOR_POSITIVE, _COLOR_NEGATIVE, _COLOR_NEUTRAL],
+                        ),
+                        legend=alt.Legend(title=None, orient="bottom", labelFontSize=12),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("label:N", title="分類"),
+                        alt.Tooltip("count:Q", title="件数"),
+                    ],
+                )
+                .properties(height=320)
+                .configure_view(strokeWidth=0)
+            )
+            st.altair_chart(sent_chart, use_container_width=True)
+        else:
+            st.info("センチメント情報がありません。")
+
+    with col_topic:
+        topics = summary.get("topics", []) or []
+        st.markdown("**トピック（件数の多い順）**")
+        if topics:
+            topic_df = pd.DataFrame(
+                [
+                    {
+                        "topic": t.get("label", ""),
+                        "count": int(t.get("count", 0)),
+                        "examples": " / ".join(t.get("examples", []) or []),
+                    }
+                    for t in topics
+                ]
+            )
+            topic_chart = (
+                alt.Chart(topic_df)
+                .mark_bar(cornerRadiusEnd=4)
+                .encode(
+                    x=alt.X("count:Q", title="件数", axis=alt.Axis(grid=True, tickMinStep=1)),
+                    y=alt.Y(
+                        "topic:N",
+                        sort="-x",
+                        title=None,
+                        axis=alt.Axis(labelLimit=240, labelFontSize=12),
+                    ),
+                    color=alt.Color(
+                        "count:Q",
+                        scale=alt.Scale(scheme="blues"),
+                        legend=None,
+                    ),
+                    tooltip=[
+                        alt.Tooltip("topic:N", title="トピック"),
+                        alt.Tooltip("count:Q", title="件数"),
+                        alt.Tooltip("examples:N", title="代表表現"),
+                    ],
+                )
+                .properties(height=max(220, 36 * len(topic_df)))
+                .configure_view(strokeWidth=0)
+                .configure_axis(labelColor="#475569", titleColor="#334155")
+            )
+            st.altair_chart(topic_chart, use_container_width=True)
+
+            with st.expander("トピックの代表表現を見る", expanded=False):
+                st.dataframe(
+                    topic_df.rename(
+                        columns={"topic": "トピック", "count": "件数", "examples": "代表表現"}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            st.info("トピックは検出されませんでした。")
+
+    # ---- キーワードと代表回答 ----
+    col_kw, col_hl = st.columns([3, 2], gap="large")
+
+    keywords = summary.get("keywords", []) or []
+    with col_kw:
+        st.markdown("**頻出キーワード**")
+        if keywords:
+            kw_df = pd.DataFrame(
+                [{"word": k.get("word", ""), "count": int(k.get("count", 0))} for k in keywords]
+            )
+            kw_chart = (
+                alt.Chart(kw_df)
+                .mark_bar(cornerRadiusEnd=4, color=_COLOR_ACCENT)
+                .encode(
+                    x=alt.X("count:Q", title="出現数", axis=alt.Axis(tickMinStep=1)),
+                    y=alt.Y(
+                        "word:N",
+                        sort="-x",
+                        title=None,
+                        axis=alt.Axis(labelLimit=200, labelFontSize=12),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("word:N", title="キーワード"),
+                        alt.Tooltip("count:Q", title="出現数"),
+                    ],
+                )
+                .properties(height=max(180, 28 * len(kw_df)))
+                .configure_view(strokeWidth=0)
+                .configure_axis(labelColor="#475569", titleColor="#334155")
+            )
+            st.altair_chart(kw_chart, use_container_width=True)
+        else:
+            st.info("キーワードは検出されませんでした。")
+
     highlights = summary.get("highlights", {}) or {}
-    pos = highlights.get("positive", []) or []
-    neg = highlights.get("negative", []) or []
-    if pos or neg:
+    pos_h = highlights.get("positive", []) or []
+    neg_h = highlights.get("negative", []) or []
+    with col_hl:
         st.markdown("**代表的な回答**")
-        if pos:
-            st.markdown("- ポジティブ:")
-            for s in pos:
-                st.markdown(f"  - {s}")
-        if neg:
-            st.markdown("- ネガティブ:")
-            for s in neg:
-                st.markdown(f"  - {s}")
+        if pos_h:
+            st.markdown(
+                f'<div style="background:{_COLOR_POSITIVE}11;border-left:4px solid {_COLOR_POSITIVE};'
+                'padding:10px 14px;border-radius:6px;margin-bottom:8px;">'
+                '<strong style="color:#16a34a;">ポジティブ</strong></div>',
+                unsafe_allow_html=True,
+            )
+            for s in pos_h:
+                st.markdown(f"- {s}")
+        if neg_h:
+            st.markdown(
+                f'<div style="background:{_COLOR_NEGATIVE}11;border-left:4px solid {_COLOR_NEGATIVE};'
+                'padding:10px 14px;border-radius:6px;margin:12px 0 8px 0;">'
+                '<strong style="color:#dc2626;">ネガティブ</strong></div>',
+                unsafe_allow_html=True,
+            )
+            for s in neg_h:
+                st.markdown(f"- {s}")
+        if not pos_h and not neg_h:
+            st.info("代表回答は抽出されませんでした。")
 
 
 def _render_image_comparison(idx: int, pf: dict) -> None:
-    """原画像との対比ビュー."""
+    """原画像との対比ビュー（大きく見やすく）."""
     st.markdown("**🖼️ 原画像との対比**")
     page_images = pf.get("page_images") or []
     if not page_images:
         st.info("原画像が保持されていません（旧フォーマットの結果）。再アップロードで利用可能になります。")
         return
-    st.caption("該当ページを選んで、OCRテキストと並べて確認できます。")
 
     page_options = [pnum for _b, pnum in page_images]
-    selected = st.selectbox(
-        "表示するページ",
-        options=page_options,
-        index=0,
-        key=f"img_page_{idx}",
-    )
+
+    col_page, col_layout = st.columns([2, 3])
+    with col_page:
+        selected = st.selectbox(
+            "表示するページ",
+            options=page_options,
+            index=0,
+            key=f"img_page_{idx}",
+            help="該当ページを選んで原画像と文字起こしテキストを比較できます。",
+        )
+    with col_layout:
+        layout_mode = st.radio(
+            "表示レイアウト",
+            options=["横並び（対比）", "縦並び（画像を大きく表示）"],
+            horizontal=True,
+            key=f"img_layout_{idx}",
+            label_visibility="collapsed",
+        )
 
     img_bytes = None
     for b, pnum in page_images:
@@ -656,13 +960,32 @@ def _render_image_comparison(idx: int, pf: dict) -> None:
         st.warning("画像が見つかりませんでした。")
         return
 
-    col_img, col_txt = st.columns([1, 1])
-    with col_img:
-        st.image(img_bytes, caption=f"ページ {selected}", use_container_width=True)
-    with col_txt:
-        st.markdown(f"**ページ {selected} の文字起こしテキスト**")
-        st.caption("[P.{selected}] 識別子を含む行を抽出して表示しています。".replace("{selected}", str(selected)))
-        snippet = _extract_page_snippet(pf["current_text"], selected)
+    snippet = _extract_page_snippet(pf["current_text"], selected)
+
+    if layout_mode == "横並び（対比）":
+        # ワイドレイアウトでは画像側を広めに（6:4）し、画像をしっかり大きく表示
+        col_img, col_txt = st.columns([6, 4], gap="large")
+        with col_img:
+            st.markdown(f"**📄 ページ {selected} の原画像**")
+            st.image(img_bytes, use_container_width=True)
+        with col_txt:
+            st.markdown(f"**✏️ ページ {selected} の文字起こし抜粋**")
+            st.caption(f"識別子 [P.{selected}] を含む行を抽出しています。")
+            st.text_area(
+                f"ページ {selected} 抜粋",
+                value=snippet,
+                height=620,
+                key=f"img_text_{idx}_{selected}",
+                label_visibility="collapsed",
+            )
+    else:
+        st.markdown(f"**📄 ページ {selected} の原画像**")
+        # 中央寄せの大きな画像
+        col_lp, col_img, col_rp = st.columns([1, 6, 1])
+        with col_img:
+            st.image(img_bytes, use_container_width=True)
+        st.markdown(f"**✏️ ページ {selected} の文字起こし抜粋**")
+        st.caption(f"識別子 [P.{selected}] を含む行を抽出しています。")
         st.text_area(
             f"ページ {selected} 抜粋",
             value=snippet,
@@ -670,6 +993,16 @@ def _render_image_comparison(idx: int, pf: dict) -> None:
             key=f"img_text_{idx}_{selected}",
             label_visibility="collapsed",
         )
+
+    # ダウンロードボタン（高解像度画像をそのまま）
+    st.download_button(
+        label="🖼️ このページの原画像をダウンロード",
+        data=img_bytes,
+        file_name=f"{extract_filename(pf['filename'])}_page{selected}.png",
+        mime="image/png",
+        use_container_width=False,
+        key=f"img_dl_{idx}_{selected}",
+    )
 
 
 def _extract_page_snippet(text: str, page_num: int) -> str:
@@ -715,33 +1048,104 @@ def _render_cost_dashboard() -> None:
         st.caption("まだ API 呼び出しは行われていません。文字起こしや加工を実行すると統計が表示されます。")
         return
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("総呼び出し回数", summary["total_calls"])
-    col2.metric("処理時間 合計", f"{summary['total_duration_sec']:.1f} 秒")
-    col3.metric("失敗", summary["failed_calls"])
-    col4.metric("推定コスト (USD)", f"${summary['estimated_cost_usd']:.6f}")
+    # ---- メトリクスカード ----
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(
+            _metric_card("総呼び出し回数", f"{summary['total_calls']}", color=_COLOR_PRIMARY),
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            _metric_card("合計処理時間", f"{summary['total_duration_sec']:.1f} 秒", color=_COLOR_ACCENT),
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            _metric_card(
+                "失敗回数",
+                f"{summary['failed_calls']}",
+                color=_COLOR_NEGATIVE if summary["failed_calls"] > 0 else _COLOR_NEUTRAL,
+            ),
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            _metric_card("推定コスト", f"${summary['estimated_cost_usd']:.6f}", color=_COLOR_WARNING),
+            unsafe_allow_html=True,
+        )
 
-    col5, col6, col7 = st.columns(3)
-    col5.metric("入力文字数 合計", f"{summary['total_input_chars']:,}")
-    col6.metric("出力文字数 合計", f"{summary['total_output_chars']:,}")
-    col7.metric("1回あたり平均時間", f"{summary['average_duration_sec']:.1f} 秒")
+    st.markdown('<div style="margin-top: 16px;"></div>', unsafe_allow_html=True)
 
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        st.markdown(
+            _metric_card("入力文字数 合計", f"{summary['total_input_chars']:,}", color="#0f172a"),
+            unsafe_allow_html=True,
+        )
+    with c6:
+        st.markdown(
+            _metric_card("出力文字数 合計", f"{summary['total_output_chars']:,}", color="#0f172a"),
+            unsafe_allow_html=True,
+        )
+    with c7:
+        st.markdown(
+            _metric_card("1回あたり平均", f"{summary['average_duration_sec']:.1f} 秒", color="#0f172a"),
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div style="margin-top: 18px;"></div>', unsafe_allow_html=True)
+
+    # ---- 目的別サマリー (横棒チャート + テーブル) ----
     per_purpose = cost_tracker.per_purpose_summary()
     if per_purpose:
-        st.markdown("**目的別サマリー**")
-        rows = [
-            {
-                "用途": p["purpose"],
-                "回数": p["calls"],
-                "合計秒": f"{p['duration_sec']:.1f}",
-                "入力chars": p["input_chars"],
-                "出力chars": p["output_chars"],
-                "失敗": p["errors"],
-                "推定$": f"${p['estimated_cost_usd']:.6f}",
-            }
-            for p in per_purpose
-        ]
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        col_chart, col_table = st.columns([3, 4], gap="large")
+        with col_chart:
+            st.markdown("**用途別の呼び出し回数**")
+            pp_df = pd.DataFrame(
+                [
+                    {"purpose": p["purpose"], "calls": p["calls"], "duration": p["duration_sec"]}
+                    for p in per_purpose
+                ]
+            )
+            pp_chart = (
+                alt.Chart(pp_df)
+                .mark_bar(cornerRadiusEnd=4)
+                .encode(
+                    x=alt.X("calls:Q", title="回数", axis=alt.Axis(tickMinStep=1)),
+                    y=alt.Y(
+                        "purpose:N",
+                        sort="-x",
+                        title=None,
+                        axis=alt.Axis(labelLimit=240, labelFontSize=12),
+                    ),
+                    color=alt.Color("calls:Q", scale=alt.Scale(scheme="blues"), legend=None),
+                    tooltip=[
+                        alt.Tooltip("purpose:N", title="用途"),
+                        alt.Tooltip("calls:Q", title="回数"),
+                        alt.Tooltip("duration:Q", title="合計秒"),
+                    ],
+                )
+                .properties(height=max(200, 32 * len(pp_df)))
+                .configure_view(strokeWidth=0)
+                .configure_axis(labelColor="#475569", titleColor="#334155")
+            )
+            st.altair_chart(pp_chart, use_container_width=True)
+        with col_table:
+            st.markdown("**用途別サマリー（詳細）**")
+            rows = [
+                {
+                    "用途": p["purpose"],
+                    "回数": p["calls"],
+                    "合計秒": round(p["duration_sec"], 1),
+                    "入力chars": p["input_chars"],
+                    "出力chars": p["output_chars"],
+                    "失敗": p["errors"],
+                    "推定$": f"${p['estimated_cost_usd']:.6f}",
+                }
+                for p in per_purpose
+            ]
+            st.dataframe(rows, use_container_width=True, hide_index=True)
 
     with st.expander("直近の呼び出し履歴（最大50件）", expanded=False):
         records = cost_tracker.recent_records(50)
@@ -880,167 +1284,203 @@ def _render_results() -> None:
 
     st.divider()
     st.subheader("📄 処理結果")
+    st.caption(
+        f"{len(st.session_state.processed_files)} 件のファイルを処理しました。"
+        "各ファイルのタブを切り替えて、編集・分析・対比表示・ダウンロードを行えます。"
+    )
 
     doc_generator = DocumentGenerator()
 
     for idx, pf in enumerate(st.session_state.processed_files):
-        with st.expander(f"📋 {pf['filename']}", expanded=True):
+        st.markdown(
+            f'<div class="file-card-header">📋 {pf["filename"]}'
+            f'<span style="color:#94a3b8; font-weight:400; margin-left:12px;">'
+            f'（ページ数: {len(pf.get("page_images") or [])} / 文字数: {len(pf.get("current_text", "")):,}）'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
+        _render_file_tabs(idx, pf, doc_generator)
+        st.markdown('<div style="margin-top: 28px;"></div>', unsafe_allow_html=True)
 
-            # Version counter: incremented on apply/reset to force text_area re-render
-            ver_key = f"text_ver_{idx}"
-            if ver_key not in st.session_state:
-                st.session_state[ver_key] = 0
-            ver = st.session_state[ver_key]
 
-            # ---- Editable transcription ----
-            st.markdown("**✏️ 文字起こし結果**")
-            st.caption("テキストエリアを直接クリックして編集できます。加工後の結果もここに反映されます。")
-            edited = st.text_area(
-                "文字起こし結果",
-                value=pf["current_text"],
-                height=300,
-                key=f"text_area_{idx}_v{ver}",
-                label_visibility="collapsed",
+def _render_file_tabs(idx: int, pf: dict, doc_generator: DocumentGenerator) -> None:
+    """1ファイル分の処理結果をタブで構成して表示する."""
+    tab_edit, tab_resp, tab_quant, tab_image, tab_dl = st.tabs(
+        [
+            "✏️ 編集・加工",
+            "👥 回答者ビュー",
+            "📊 定量分析",
+            "🖼️ 原画像対比",
+            "📥 ダウンロード",
+        ]
+    )
+
+    with tab_edit:
+        _render_edit_tab(idx, pf)
+
+    with tab_resp:
+        _render_respondent_view(idx, pf)
+
+    with tab_quant:
+        _render_quant_summary(idx, pf)
+
+    with tab_image:
+        _render_image_comparison(idx, pf)
+
+    with tab_dl:
+        _render_download_tab(idx, pf, doc_generator)
+
+
+def _render_edit_tab(idx: int, pf: dict) -> None:
+    """文字起こしテキストの編集・加工 UI."""
+    ver_key = f"text_ver_{idx}"
+    if ver_key not in st.session_state:
+        st.session_state[ver_key] = 0
+    ver = st.session_state[ver_key]
+
+    col_text, col_tools = st.columns([3, 2], gap="large")
+
+    with col_text:
+        st.markdown("**✏️ 文字起こし結果**")
+        st.caption(
+            "テキストエリアを直接クリックして編集できます。"
+            "加工後の結果もここに反映されます。"
+        )
+        edited = st.text_area(
+            "文字起こし結果",
+            value=pf["current_text"],
+            height=520,
+            key=f"text_area_{idx}_v{ver}",
+            label_visibility="collapsed",
+        )
+        if edited != pf["current_text"]:
+            pf["current_text"] = edited
+
+    with col_tools:
+        st.markdown("**🛠️ テキスト加工**")
+        st.caption("加工を適用すると、左のテキストエリアに結果が反映されます。")
+
+        with st.expander("各モードの説明を見る", expanded=False):
+            for k, info in EDITING_MODES.items():
+                st.markdown(f"**{info['label']}**：{info['description']}")
+
+        edit_mode = st.radio(
+            "加工モード",
+            options=list(EDITING_MODES.keys()),
+            format_func=lambda x: f"{EDITING_MODES[x]['label']} — {EDITING_MODES[x]['short_desc']}",
+            horizontal=False,
+            key=f"edit_mode_{idx}",
+            label_visibility="collapsed",
+        )
+
+        custom_prompt = ""
+        if edit_mode == "custom":
+            custom_prompt = st.text_area(
+                "カスタムプロンプト",
+                placeholder=(
+                    "例: 敬語に変換してください\n"
+                    "例: 重要な箇所を箇条書きにまとめてください\n"
+                    "例: 英語に翻訳してください"
+                ),
+                height=100,
+                key=f"custom_prompt_{idx}",
             )
-            # Capture manual edits
-            if edited != pf["current_text"]:
-                pf["current_text"] = edited
 
-            st.divider()
+        col_apply, col_reset = st.columns([2, 1])
+        with col_apply:
+            if st.button(
+                f"✨ {EDITING_MODES[edit_mode]['label']}を適用",
+                key=f"apply_{idx}",
+                use_container_width=True,
+                type="primary",
+            ):
+                if edit_mode == "custom" and not custom_prompt.strip():
+                    st.warning("カスタムプロンプトを入力してください。")
+                else:
+                    try:
+                        editor = TextEditor()
+                        with st.spinner("テキストを加工中..."):
+                            result = editor.apply_editing(
+                                pf["current_text"], edit_mode, custom_prompt
+                            )
+                        pf["current_text"] = result
+                        st.session_state[ver_key] += 1
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"加工エラー: {str(e)}")
+        with col_reset:
+            if st.button(
+                "↩️ 元に戻す",
+                key=f"reset_{idx}",
+                use_container_width=True,
+            ):
+                pf["current_text"] = pf["transcription"]
+                st.session_state[ver_key] += 1
+                st.rerun()
 
-            # ---- Text editing tools ----
-            st.markdown("**🛠️ テキスト加工**")
-            st.caption("加工を適用すると、上のテキストエリアに結果が反映されます。そのまま追加編集も可能です。")
 
-            with st.expander("各モードの説明を見る", expanded=False):
-                for k, info in EDITING_MODES.items():
-                    st.markdown(f"**{info['label']}**：{info['description']}")
-
-            edit_mode = st.radio(
-                "加工モード",
-                options=list(EDITING_MODES.keys()),
-                format_func=lambda x: f"{EDITING_MODES[x]['label']}　— {EDITING_MODES[x]['short_desc']}",
-                horizontal=False,
-                key=f"edit_mode_{idx}",
-                label_visibility="collapsed",
+def _render_download_tab(idx: int, pf: dict, doc_generator: DocumentGenerator) -> None:
+    """ダウンロード（Word / Excel）タブ."""
+    st.markdown("**📥 ダウンロード**")
+    st.caption(
+        "現在のテキスト（加工済みの場合は加工後）でファイルを生成します。"
+        "Word と Excel から選択できます。"
+    )
+    col_dl_w, col_dl_x = st.columns(2, gap="large")
+    with col_dl_w:
+        st.markdown("**📄 Word**")
+        st.caption("文字起こし結果を Word ファイルとして書き出します。")
+        try:
+            word_content = doc_generator.create_document(
+                pf["current_text"], pf["filename"]
             )
-
-            custom_prompt = ""
-            if edit_mode == "custom":
-                custom_prompt = st.text_area(
-                    "カスタムプロンプト",
-                    placeholder=(
-                        "例: 敬語に変換してください\n"
-                        "例: 重要な箇所を箇条書きにまとめてください\n"
-                        "例: 英語に翻訳してください"
-                    ),
-                    height=100,
-                    key=f"custom_prompt_{idx}",
-                )
-
-            col_apply, col_reset = st.columns([2, 1])
-            with col_apply:
-                if st.button(
-                    f"✨ {EDITING_MODES[edit_mode]['label']}を適用",
-                    key=f"apply_{idx}",
-                    use_container_width=True,
-                    type="primary",
-                ):
-                    if edit_mode == "custom" and not custom_prompt.strip():
-                        st.warning("カスタムプロンプトを入力してください。")
-                    else:
-                        try:
-                            editor = TextEditor()
-                            with st.spinner("テキストを加工中..."):
-                                result = editor.apply_editing(
-                                    pf["current_text"], edit_mode, custom_prompt
-                                )
-                            pf["current_text"] = result
-                            st.session_state[ver_key] += 1  # Force text_area re-render
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"加工エラー: {str(e)}")
-
-            with col_reset:
-                if st.button(
-                    "↩️ 元に戻す",
-                    key=f"reset_{idx}",
-                    use_container_width=True,
-                ):
-                    pf["current_text"] = pf["transcription"]
-                    st.session_state[ver_key] += 1  # Force text_area re-render
-                    st.rerun()
-
-            st.divider()
-
-            # ---- Respondent view (per-respondent grouping) ----
-            _render_respondent_view(idx, pf)
-
-            st.divider()
-
-            # ---- Quantitative summary ----
-            _render_quant_summary(idx, pf)
-
-            st.divider()
-
-            # ---- Original image comparison ----
-            _render_image_comparison(idx, pf)
-
-            st.divider()
-
-            # ---- Download ----
-            st.markdown("**📥 ダウンロード**")
-            st.caption(
-                "現在のテキスト（加工済みの場合は加工後）でファイルを生成します。"
-                "Word と Excel から選択できます。"
+            st.download_button(
+                label="📥 Word ファイルをダウンロード",
+                data=word_content,
+                file_name=f"{extract_filename(pf['filename'])}_transcription.docx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                use_container_width=True,
+                key=f"download_{idx}",
+                type="primary",
             )
-            col_dl_w, col_dl_x = st.columns(2)
-            with col_dl_w:
-                try:
-                    word_content = doc_generator.create_document(
-                        pf["current_text"], pf["filename"]
-                    )
-                    st.download_button(
-                        label="📥 Word",
-                        data=word_content,
-                        file_name=f"{extract_filename(pf['filename'])}_transcription.docx",
-                        mime=(
-                            "application/vnd.openxmlformats-officedocument."
-                            "wordprocessingml.document"
-                        ),
-                        use_container_width=True,
-                        key=f"download_{idx}",
-                    )
-                except Exception as e:
-                    st.error(f"Word 生成エラー: {str(e)}")
-            with col_dl_x:
-                try:
-                    parsed_q = survey_analyzer.parse_consolidated_text(pf["current_text"])
-                    respondents = survey_analyzer.to_respondent_view(parsed_q)
-                    quant = pf.get("quant_summary")
-                    excel_bytes = excel_exporter.build_workbook(
-                        questions=parsed_q,
-                        respondents=respondents,
-                        quant_summary=quant,
-                        source_filename=pf["filename"],
-                    )
-                    st.download_button(
-                        label="📥 Excel",
-                        data=excel_bytes,
-                        file_name=f"{extract_filename(pf['filename'])}_transcription.xlsx",
-                        mime=(
-                            "application/vnd.openxmlformats-officedocument."
-                            "spreadsheetml.sheet"
-                        ),
-                        use_container_width=True,
-                        key=f"download_xlsx_{idx}",
-                    )
-                except Exception as e:
-                    st.warning(
-                        "Excel を生成するには、まず「質問ごとにまとめる」加工で"
-                        "[P.N] 識別子付きテキストにしてください。"
-                    )
-                    st.caption(f"内部エラー: {e}")
+        except Exception as e:
+            st.error(f"Word 生成エラー: {str(e)}")
+    with col_dl_x:
+        st.markdown("**📊 Excel**")
+        st.caption(
+            "質問別シート・回答者別マトリクス・定量サマリーを 1 ファイルで書き出します。"
+        )
+        try:
+            parsed_q = survey_analyzer.parse_consolidated_text(pf["current_text"])
+            respondents = survey_analyzer.to_respondent_view(parsed_q)
+            quant = pf.get("quant_summary")
+            excel_bytes = excel_exporter.build_workbook(
+                questions=parsed_q,
+                respondents=respondents,
+                quant_summary=quant,
+                source_filename=pf["filename"],
+            )
+            st.download_button(
+                label="📥 Excel ファイルをダウンロード",
+                data=excel_bytes,
+                file_name=f"{extract_filename(pf['filename'])}_transcription.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                use_container_width=True,
+                key=f"download_xlsx_{idx}",
+                type="primary",
+            )
+        except Exception as e:
+            st.warning(
+                "Excel を生成するには、まず「質問ごとにまとめる」加工で"
+                "[P.N] 識別子付きテキストにしてください。"
+            )
+            st.caption(f"内部エラー: {e}")
 
     # ---- Survey analysis ----
     st.divider()
@@ -1098,13 +1538,6 @@ def _render_results() -> None:
         except Exception as e:
             st.error(f"Word 生成エラー: {str(e)}")
 
-    st.divider()
-    if st.button("🗑️ すべてクリア", use_container_width=True):
-        st.session_state.processed_files = []
-        st.session_state.survey_analysis = ""
-        st.rerun()
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1113,97 +1546,158 @@ def main():
     st.set_page_config(
         page_title="手書きアンケートOCR",
         page_icon="📝",
-        layout="centered",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
 
     _init_session_state()
+    _inject_global_css()
 
-    # ---- Header ----
-    st.title("📝 手書きアンケート OCR・文字起こしアプリ")
-    st.markdown(
-        "手書きのアンケート（PDF・画像）をアップロードし、"
-        "**Gemini AI** で文字起こしして **Word ファイル**としてダウンロードできます。"
+    # ---- Sidebar: 設定パネル ----
+    _render_sidebar()
+
+    # ---- Header (メイン) ----
+    col_title, col_meta = st.columns([5, 2])
+    with col_title:
+        st.markdown(
+            f'<h1 style="margin-bottom:0;">📝 手書きアンケート OCR・文字起こしアプリ</h1>'
+            f'<div style="color:#64748b;margin-top:4px;">'
+            f'手書きアンケートを Gemini AI で文字起こしし、編集・分析・出力までを 1 つの画面で行えます。'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with col_meta:
+        st.markdown(
+            f'<div style="text-align:right;padding-top:12px;">'
+            f'<span style="background:{_COLOR_PRIMARY}15;color:{_COLOR_PRIMARY};'
+            f'padding:6px 12px;border-radius:14px;font-size:0.85rem;font-weight:600;">'
+            f'Ver. {APP_VERSION}</span>'
+            f'<div style="color:#94a3b8;font-size:0.8rem;margin-top:4px;">'
+            f'{APP_UPDATED} 更新</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div style="margin-bottom: 20px;"></div>', unsafe_allow_html=True)
+
+    # ---- Main tabs ----
+    tab_upload, tab_proof, tab_template, tab_cost, tab_about = st.tabs(
+        [
+            "📁 アップロード & 結果",
+            "📝 文字校正チェック",
+            "🪄 設問テンプレート生成",
+            "💰 API 利用状況",
+            "ℹ️ アプリ情報",
+        ]
     )
 
-    col_model, col_ver = st.columns([3, 1])
-    with col_model:
+    with tab_upload:
+        _render_upload_tab()
+
+    with tab_proof:
+        _render_proof_tab()
+
+    with tab_template:
+        _render_template_section_tab()
+
+    with tab_cost:
+        _render_cost_tab()
+
+    with tab_about:
+        _render_about_tab()
+
+
+def _render_sidebar() -> None:
+    """サイドバーに OCR 設定・除外設定・更新履歴をまとめる."""
+    with st.sidebar:
+        st.markdown("### ⚙️ 文字起こし設定")
+        _render_ocr_mode_section()
+
+        st.markdown("---")
+        st.markdown("### 🚫 文字起こし除外設定")
+        st.caption(
+            "アンケート用紙に印刷されているタイトルや質問文など、"
+            "文字起こし不要のテキストを指定できます。"
+        )
+        _render_exclude_section()
+
+        st.markdown("---")
         with st.expander("ℹ️ 使用モデル情報", expanded=False):
             st.markdown(
                 f"**{MODEL_LABEL}** &nbsp; `{MODEL_NAME}`  \n"
                 f"{MODEL_DESCRIPTION}"
             )
-    with col_ver:
-        st.markdown(
-            f"<div style='text-align:right; color:gray; font-size:0.85em;'>"
-            f"Ver. {APP_VERSION}<br>{APP_UPDATED} 更新</div>",
-            unsafe_allow_html=True,
-        )
 
-    with st.expander("📋 更新履歴", expanded=False):
-        for entry in CHANGELOG:
-            st.markdown(
-                f"**v{entry['version']}** &nbsp; "
-                f"<span style='color:gray; font-size:0.9em;'>{entry['date']}</span>",
-                unsafe_allow_html=True,
-            )
-            for change in entry["changes"]:
-                st.markdown(f"&nbsp;&nbsp;• {change}")
 
-    st.divider()
-
-    # ---- OCR mode ----
-    _render_ocr_mode_section()
-
-    st.divider()
-
-    # ---- Exclude section (collapsed by default) ----
-    with st.expander("🚫 文字起こし除外設定", expanded=False):
-        _render_exclude_section()
-
-    st.divider()
-
-    # ---- File upload ----
+def _render_upload_tab() -> None:
     st.subheader("📁 ファイルのアップロード")
+    st.caption(
+        "手書きアンケートのファイルを選択してください（複数選択可能）。"
+        "対応形式: PDF, PNG, JPG, JPEG, GIF, WebP, BMP, TIFF"
+    )
 
     supported_types = [ext.lstrip(".") for ext in get_supported_extensions_list()]
 
     uploaded_files = st.file_uploader(
-        "手書きアンケートのファイルを選択してください（複数選択可能）",
+        "ファイルを選択",
         type=supported_types,
         accept_multiple_files=True,
-        help="対応形式: PDF, PNG, JPG, JPEG, GIF, WebP, BMP, TIFF",
+        label_visibility="collapsed",
     )
 
     if uploaded_files:
         st.success(f"{len(uploaded_files)} 個のファイルがアップロードされました")
-
-        with st.expander("アップロードされたファイル一覧", expanded=True):
+        with st.expander("アップロードされたファイル一覧", expanded=False):
             for i, f in enumerate(uploaded_files):
                 st.write(f"{i + 1}. **{f.name}** ({f.size:,} bytes)")
-
-        if st.button("📝 文字起こしを開始", type="primary", use_container_width=True):
+        if st.button(
+            "📝 文字起こしを開始",
+            type="primary",
+            use_container_width=True,
+        ):
             _process_files(uploaded_files)
 
-    # ---- Results ----
     _render_results()
 
-    # ---- Standalone proofread section ----
-    st.divider()
+    if st.session_state.processed_files:
+        st.divider()
+        if st.button(
+            "🗑️ 全ての処理結果をクリア",
+            use_container_width=False,
+            key="clear_all_results",
+        ):
+            st.session_state.processed_files = []
+            st.session_state.survey_analysis = ""
+            st.rerun()
+
+
+def _render_proof_tab() -> None:
     st.subheader("📝 文字校正チェック（コピペ）")
-    with st.expander("テキストを貼り付けて誤字脱字・違和感をチェックする", expanded=False):
-        _render_proofread_section()
+    _render_proofread_section()
 
-    # ---- Auto-generate exclude template ----
-    st.divider()
+
+def _render_template_section_tab() -> None:
     st.subheader("🪄 設問テンプレートの自動生成")
-    with st.expander("アップロード結果から除外テンプレートを抽出する", expanded=False):
-        _render_auto_template_section()
+    _render_auto_template_section()
 
-    # ---- API cost / time dashboard ----
-    st.divider()
+
+def _render_cost_tab() -> None:
     st.subheader("💰 API 利用状況・処理時間")
-    with st.expander("呼び出し回数・処理時間・推定コストを見る", expanded=False):
-        _render_cost_dashboard()
+    _render_cost_dashboard()
+
+
+def _render_about_tab() -> None:
+    st.subheader("ℹ️ アプリ情報")
+    st.markdown(
+        f"**{MODEL_LABEL}** &nbsp; `{MODEL_NAME}`  \n"
+        f"{MODEL_DESCRIPTION}"
+    )
+    st.markdown("---")
+    st.markdown("### 📋 更新履歴")
+    for entry in CHANGELOG:
+        with st.expander(f"v{entry['version']} — {entry['date']}", expanded=False):
+            for change in entry["changes"]:
+                st.markdown(f"- {change}")
 
 
 if __name__ == "__main__":
