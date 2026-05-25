@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import io
+import re
 import tempfile
 from pathlib import Path
 
@@ -51,23 +52,39 @@ _COLOR_WARNING = "#f59e0b"
 
 _GLOBAL_CSS = """
 <style>
-/* メインコンテナを十分広く */
+/* メインコンテナをビューポート幅いっぱいまで広げる */
 .block-container {
     padding-top: 1.6rem;
     padding-bottom: 4rem;
     padding-left: 2.2rem;
     padding-right: 2.2rem;
-    max-width: 1600px;
+    max-width: none;
 }
-/* サイドバー幅を少し広めに固定 */
+
+/* サイドバー: 展開時のみ広めの幅を指定、折りたたみ時は Streamlit の挙動に任せる */
+section[data-testid="stSidebar"][aria-expanded="true"] > div {
+    width: 360px;
+}
 section[data-testid="stSidebar"] {
-    width: 360px !important;
-    min-width: 360px !important;
-    max-width: 420px !important;
     background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
 }
 section[data-testid="stSidebar"] .block-container {
     padding: 1.5rem 1rem 2rem 1rem;
+}
+/* 折りたたみ時に空のスペースを残さない */
+section[data-testid="stSidebar"][aria-expanded="false"] {
+    width: 0 !important;
+    min-width: 0 !important;
+    margin-left: -1px !important;
+}
+section[data-testid="stSidebar"][aria-expanded="false"] > div {
+    width: 0 !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+}
+/* 折りたたみ時の余白を除去してメインを広く */
+[data-testid="stAppViewContainer"] > .main {
+    transition: padding-left 0.2s ease;
 }
 /* タブを少し大きめに */
 .stTabs [data-baseweb="tab-list"] {
@@ -159,6 +176,108 @@ def _metric_card(label: str, value, sub: str = "", color: str = _COLOR_PRIMARY) 
         f'<div class="sub">{sub}</div>'
         f'</div>'
     )
+
+
+# ---------------------------------------------------------------------------
+# Respondent identifier helpers
+# ---------------------------------------------------------------------------
+
+_PN_PATTERN = re.compile(r"\[(?:P\.\d+|回答者\d+|F\.[^\]]+-P\.\d+)\]")
+
+
+def has_respondent_id(text: str) -> bool:
+    """テキストに [P.N] 等の回答者識別子が含まれているか."""
+    if not text:
+        return False
+    return bool(_PN_PATTERN.search(text))
+
+
+def _apply_matome(idx: int, pf: dict, rerun: bool = True) -> bool:
+    """「質問ごとにまとめる」を pf['current_text'] に適用する."""
+    try:
+        editor = TextEditor()
+        with st.spinner("質問ごとにまとめています..."):
+            result = editor.apply_editing(pf["current_text"], "matome", "")
+        pf["current_text"] = result
+        ver_key = f"text_ver_{idx}"
+        st.session_state[ver_key] = st.session_state.get(ver_key, 0) + 1
+        if rerun:
+            st.rerun()
+        return True
+    except Exception as e:
+        st.error(f"質問ごとにまとめる処理でエラーが発生しました: {str(e)}")
+        return False
+
+
+def _render_inline_matome_cta(
+    idx: int,
+    pf: dict,
+    message: str,
+    button_key_suffix: str,
+) -> None:
+    """各タブ内で「質問ごとにまとめる」を直接実行できるインラインCTA."""
+    st.markdown(
+        f'<div style="background:{_COLOR_WARNING}11;border:1px solid {_COLOR_WARNING}55;'
+        f'border-left:4px solid {_COLOR_WARNING};padding:12px 16px;border-radius:8px;'
+        f'margin:8px 0 12px 0;">'
+        f'<div style="font-weight:600;color:#b45309;margin-bottom:4px;">'
+        f'🎯 まず「質問ごとにまとめる」を実行してください</div>'
+        f'<div style="color:#475569;font-size:0.92rem;line-height:1.5;">{message}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    col_run, _ = st.columns([2, 5])
+    with col_run:
+        if st.button(
+            "✨ 質問ごとにまとめる を実行",
+            key=f"inline_matome_{button_key_suffix}_{idx}",
+            use_container_width=True,
+            type="primary",
+        ):
+            _apply_matome(idx, pf)
+
+
+def _render_matome_banner(idx: int, pf: dict) -> None:
+    """ファイルカード直下に「回答識別子を付与」CTAを表示する.
+
+    [P.N] がまだ無い場合は強調表示し、ワンクリックで適用できる。
+    既に付与済みの場合は緑色のステータスバッジを表示する。
+    """
+    if has_respondent_id(pf["current_text"]):
+        st.markdown(
+            f'<div style="background:{_COLOR_POSITIVE}11;border:1px solid {_COLOR_POSITIVE}55;'
+            f'border-left:4px solid {_COLOR_POSITIVE};padding:10px 16px;border-radius:8px;'
+            f'margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;">'
+            f'<div><strong style="color:#15803d;">✅ 回答識別子が付与されています</strong>'
+            f'<span style="color:#475569;margin-left:10px;font-size:0.9rem;">'
+            f'回答者ビュー / 定量分析 / Excel 出力など全ての機能をご利用いただけます。</span></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        f'<div style="background:{_COLOR_WARNING}11;border:1px solid {_COLOR_WARNING}55;'
+        f'border-left:4px solid {_COLOR_WARNING};padding:14px 18px;border-radius:8px;'
+        f'margin-bottom:14px;">'
+        f'<div style="font-weight:600;color:#b45309;font-size:1.05rem;margin-bottom:4px;">'
+        f'🎯 ステップ 1: まず「質問ごとにまとめる」を実行してください</div>'
+        f'<div style="color:#475569;font-size:0.92rem;line-height:1.5;">'
+        f'回答者単位ビュー・定量分析・Excel 出力など多くの機能で、'
+        f'<strong>[P.N] 形式の回答者識別子</strong>が必要です。'
+        f'この操作で印字された質問ごとに回答を集約し、回答者ごとに識別子を自動付与します。'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+    col_run, col_spacer = st.columns([2, 5])
+    with col_run:
+        if st.button(
+            "✨ 質問ごとにまとめる を実行",
+            key=f"matome_cta_{idx}",
+            use_container_width=True,
+            type="primary",
+        ):
+            _apply_matome(idx, pf)
 
 # ---------------------------------------------------------------------------
 # Session state helpers
@@ -650,9 +769,14 @@ def _render_respondent_view(idx: int, pf: dict) -> None:
     parsed = survey_analyzer.parse_consolidated_text(pf["current_text"])
     respondents = survey_analyzer.to_respondent_view(parsed)
     if not respondents:
-        st.info(
-            "回答者識別子が検出できませんでした。"
-            "「✏️ 編集・加工」タブで「質問ごとにまとめる」を実行してから再度ご確認ください。"
+        _render_inline_matome_cta(
+            idx,
+            pf,
+            message=(
+                "このビューを利用するには、まず回答者識別子の付与が必要です。"
+                "「質問ごとにまとめる」を実行すると、各回答に [P.N] が付き、回答者ごとに縦読みできるようになります。"
+            ),
+            button_key_suffix="resp",
         )
         return
 
@@ -705,6 +829,17 @@ def _render_quant_summary(idx: int, pf: dict) -> None:
         "現在のテキストを Gemini に解析させ、センチメント・トピック・キーワード・"
         "代表回答を JSON で取得し、視覚化します。"
     )
+
+    if not has_respondent_id(pf["current_text"]):
+        _render_inline_matome_cta(
+            idx,
+            pf,
+            message=(
+                "より精度の高い定量サマリーを得るためには、先に「質問ごとにまとめる」"
+                "を実行して回答者識別子を付与しておくことを推奨します（質問単位の集約とセンチメント評価が安定します）。"
+            ),
+            button_key_suffix="quant",
+        )
 
     col_run, col_clear, _ = st.columns([2, 1, 3])
     with col_run:
@@ -1292,13 +1427,24 @@ def _render_results() -> None:
     doc_generator = DocumentGenerator()
 
     for idx, pf in enumerate(st.session_state.processed_files):
+        status_chip = (
+            f'<span style="background:{_COLOR_POSITIVE}15;color:{_COLOR_POSITIVE};'
+            f'padding:3px 10px;border-radius:10px;font-size:0.75rem;font-weight:600;margin-left:10px;">'
+            f'識別子付与済</span>'
+            if has_respondent_id(pf["current_text"])
+            else f'<span style="background:{_COLOR_WARNING}15;color:#b45309;'
+                 f'padding:3px 10px;border-radius:10px;font-size:0.75rem;font-weight:600;margin-left:10px;">'
+                 f'未集約</span>'
+        )
         st.markdown(
             f'<div class="file-card-header">📋 {pf["filename"]}'
+            f'{status_chip}'
             f'<span style="color:#94a3b8; font-weight:400; margin-left:12px;">'
             f'（ページ数: {len(pf.get("page_images") or [])} / 文字数: {len(pf.get("current_text", "")):,}）'
             f'</span></div>',
             unsafe_allow_html=True,
         )
+        _render_matome_banner(idx, pf)
         _render_file_tabs(idx, pf, doc_generator)
         st.markdown('<div style="margin-top: 28px;"></div>', unsafe_allow_html=True)
 
@@ -1332,7 +1478,11 @@ def _render_file_tabs(idx: int, pf: dict, doc_generator: DocumentGenerator) -> N
 
 
 def _render_edit_tab(idx: int, pf: dict) -> None:
-    """文字起こしテキストの編集・加工 UI."""
+    """文字起こしテキストの編集・加工 UI.
+
+    「質問ごとにまとめる」をプライマリ操作として目立たせ、
+    他の加工モード（整文・要約・カスタム）はセカンダリ操作として提示する。
+    """
     ver_key = f"text_ver_{idx}"
     if ver_key not in st.session_state:
         st.session_state[ver_key] = 0
@@ -1357,17 +1507,43 @@ def _render_edit_tab(idx: int, pf: dict) -> None:
             pf["current_text"] = edited
 
     with col_tools:
-        st.markdown("**🛠️ テキスト加工**")
-        st.caption("加工を適用すると、左のテキストエリアに結果が反映されます。")
+        # ---- プライマリ: 質問ごとにまとめる ----
+        st.markdown("**🎯 ステップ 1: 質問ごとにまとめる（推奨）**")
+        st.caption(
+            "印字された質問ごとに回答を集約し、各回答に [P.N] の回答者識別子を付与します。"
+            "回答者ビュー・定量分析・Excel 出力など多くの機能で利用されます。"
+        )
+        matome_info = EDITING_MODES["matome"]
+        with st.expander("この処理の詳細を見る", expanded=False):
+            st.markdown(matome_info["description"])
+        already_done = has_respondent_id(pf["current_text"])
+        if st.button(
+            "🔁 もう一度「質問ごとにまとめる」を適用" if already_done else "✨ 質問ごとにまとめる を実行",
+            key=f"apply_matome_{idx}",
+            use_container_width=True,
+            type="primary",
+        ):
+            _apply_matome(idx, pf)
+
+        st.markdown('<div style="margin-top: 18px;"></div>', unsafe_allow_html=True)
+        st.markdown("---")
+
+        # ---- セカンダリ: その他の加工 ----
+        st.markdown("**🛠️ ステップ 2: 追加のテキスト加工（任意）**")
+        st.caption(
+            "必要に応じて文体を整えたり、要約・翻訳・敬語化などを行えます。"
+        )
+
+        secondary_modes = {k: v for k, v in EDITING_MODES.items() if k != "matome"}
 
         with st.expander("各モードの説明を見る", expanded=False):
-            for k, info in EDITING_MODES.items():
+            for k, info in secondary_modes.items():
                 st.markdown(f"**{info['label']}**：{info['description']}")
 
         edit_mode = st.radio(
             "加工モード",
-            options=list(EDITING_MODES.keys()),
-            format_func=lambda x: f"{EDITING_MODES[x]['label']} — {EDITING_MODES[x]['short_desc']}",
+            options=list(secondary_modes.keys()),
+            format_func=lambda x: f"{secondary_modes[x]['label']} — {secondary_modes[x]['short_desc']}",
             horizontal=False,
             key=f"edit_mode_{idx}",
             label_visibility="collapsed",
@@ -1389,10 +1565,9 @@ def _render_edit_tab(idx: int, pf: dict) -> None:
         col_apply, col_reset = st.columns([2, 1])
         with col_apply:
             if st.button(
-                f"✨ {EDITING_MODES[edit_mode]['label']}を適用",
+                f"✨ {secondary_modes[edit_mode]['label']}を適用",
                 key=f"apply_{idx}",
                 use_container_width=True,
-                type="primary",
             ):
                 if edit_mode == "custom" and not custom_prompt.strip():
                     st.warning("カスタムプロンプトを入力してください。")
