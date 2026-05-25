@@ -10,7 +10,7 @@ import numpy as np
 
 from cost_tracker import TimedCall
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 APP_UPDATED = "2026-05-25"
 
 MODEL_NAME = "gemini-3.1-flash-lite-preview"
@@ -21,6 +21,15 @@ MODEL_DESCRIPTION = (
 )
 
 CHANGELOG: list[dict] = [
+    {
+        "version": "1.7.0",
+        "date": "2026-05-25",
+        "changes": [
+            "複数ページPDFの質問欠落バグを根本対応: 複数ページは Gemini で全ページ一括統合方式に切替",
+            "「質問ごとにまとめる」ボタンを 1 箇所（編集タブのステップ1）に集約し、重複を排除",
+            "サイドバー折りたたみ・展開時のメイン領域重なりを解消し、自然なレイアウト変動に",
+        ],
+    },
     {
         "version": "1.6.0",
         "date": "2026-05-25",
@@ -964,12 +973,32 @@ class OCRProcessor:
     def _consolidate_questions_from_pages(self, page_results):
         """Consolidate questions and answers from multiple pages.
 
-        改良ポイント (v1.5.0):
-        - 各ページのローカルパースで質問が一部欠落していた場合、
-          他ページから取得した canonical 質問文を使い Gemini に再割り当てを依頼する。
-        - 結果として、印字質問の OCR が失敗したページの回答も正しい質問にまとめられる。
-        - 各回答には [P.N] のページ識別子を付与し、同一回答者の追跡を可能にする。
+        改良ポイント (v1.7.0):
+        - 複数ページ PDF では Gemini に「全ページ一括統合」を依頼することで
+          OCR が一部質問を欠落しても、canonical 質問の特定と回答の正確な分類を実現する。
+        - 単一ページのときはローカルパースで十分なので追加 API 呼び出しは行わない。
+        - フォールバックとして従来のローカル集約 + 質問再割り当てロジックも保持する。
         """
+        if not page_results:
+            return ""
+
+        # --- 単一ページならローカル集約で完結 ---
+        if len(page_results) == 1:
+            return self._local_consolidate(page_results)
+
+        # --- 複数ページは Gemini で全ページ一括統合（最重要のロバストパス） ---
+        try:
+            unified = self._unified_consolidate_via_gemini(page_results)
+            if unified and unified.strip() and "Q1" in unified.upper().replace("Ｑ", "Q"):
+                return unified
+        except Exception as e:
+            print(f"統合集約が失敗、ローカル集約にフォールバック: {e}")
+
+        # --- フォールバック: ローカル集約 + 再割り当て ---
+        return self._local_consolidate(page_results)
+
+    def _local_consolidate(self, page_results):
+        """各ページをローカルパースし、不足分は Gemini に再割り当てさせる従来パス."""
         if not page_results:
             return ""
 
@@ -1071,6 +1100,65 @@ class OCRProcessor:
             result_lines.append("")
 
         return "\n".join(result_lines)
+
+    def _unified_consolidate_via_gemini(self, page_results: list[dict]) -> str:
+        """全ページの OCR テキストを 1 回の Gemini 呼び出しで統合集約する.
+
+        各ページの OCR で印字質問が一部欠落していても、ページ全体の文脈から
+        canonical 質問の特定と回答の分類を Gemini に任せる。
+        """
+        if not page_results:
+            return ""
+
+        pages_section = "\n\n".join(
+            f"--- ページ {pr['page_num']} ---\n{pr.get('text', '').strip()}"
+            for pr in page_results
+            if pr.get('text', '').strip()
+        )
+        if not pages_section:
+            return ""
+
+        prompt = f"""\
+あなたはアンケート集約の専門家です。以下は同一のアンケート用紙を複数の回答者が記入した
+複数ページの OCR 結果です。各ページは 1 名の回答者に相当し、ページ番号 = 回答者番号です。
+
+【ページごとの OCR テキスト】
+{pages_section}
+
+【あなたのタスク】
+1. このアンケート用紙に印字されている **canonical な質問一覧** を確定してください。
+   - ある質問は一部のページで OCR 認識が欠落している可能性があります。
+   - 他のページから補完して、全ての質問の最も完全な表記を採用してください。
+   - 質問番号は元の用紙に従って Q1, Q2, ... の昇順で番号付けしてください。
+2. 各回答（手書きの内容）を **正しい質問の下** に分類してください。
+   - **絶対に質問の境界を超えて回答を混在させない**でください。
+     Q2 の回答が Q1 に入る・Q1 の回答が Q2 に入るような取り違えは禁止です。
+   - ページ {{N}} に書かれていた回答には、必ず先頭に `[P.{{N}}]` を付けてください。
+   - 質問1だけ・質問2だけしか回答していない回答者がいても、その回答は該当質問の下にだけ配置してください。
+3. 該当する手書き回答がない質問の下には `・（無回答）` と 1 行だけ書いてください。
+4. **回答の取りこぼし禁止**: 各ページに書かれている手書きと思しき内容は、原則として
+   いずれかの質問の下に必ず配置してください（印字された質問文や見出しを回答として
+   出力してはいけません。手書きと判別できないものは除外してください）。
+
+【出力形式（厳守）】
+Q1: <印字された質問文をそのまま転記>
+・[P.1] 回答内容
+・[P.2] 回答内容
+
+Q2: <印字された質問文をそのまま転記>
+・[P.1] 回答内容
+・[P.3] 回答内容
+
+【出力に関する追加ルール】
+- 余計な見出し・前置き・注釈・締めの文章は一切付けないでください。出力は上記の構造のみとしてください。
+- 質問文や印字テキストを回答として出力してはいけません（手書きの内容のみ）。
+- Markdown コードフェンスや装飾は使わないでください。
+"""
+        return self._call_gemini_text(
+            prompt=prompt,
+            purpose="OCR: 全ページ統合集約",
+            timeout=240,
+        )
 
     def _has_answer_like_content(self, text: str) -> bool:
         """質問ヘッダ以外に回答らしき行が含まれているか判定."""

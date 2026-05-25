@@ -61,30 +61,12 @@ _GLOBAL_CSS = """
     max-width: none;
 }
 
-/* サイドバー: 展開時のみ広めの幅を指定、折りたたみ時は Streamlit の挙動に任せる */
-section[data-testid="stSidebar"][aria-expanded="true"] > div {
-    width: 360px;
-}
+/* サイドバー: 背景と内側パディングのみ調整し、幅・折りたたみは Streamlit の挙動に完全に任せる */
 section[data-testid="stSidebar"] {
     background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
 }
 section[data-testid="stSidebar"] .block-container {
     padding: 1.5rem 1rem 2rem 1rem;
-}
-/* 折りたたみ時に空のスペースを残さない */
-section[data-testid="stSidebar"][aria-expanded="false"] {
-    width: 0 !important;
-    min-width: 0 !important;
-    margin-left: -1px !important;
-}
-section[data-testid="stSidebar"][aria-expanded="false"] > div {
-    width: 0 !important;
-    min-width: 0 !important;
-    overflow: hidden !important;
-}
-/* 折りたたみ時の余白を除去してメインを広く */
-[data-testid="stAppViewContainer"] > .main {
-    transition: padding-left 0.2s ease;
 }
 /* タブを少し大きめに */
 .stTabs [data-baseweb="tab-list"] {
@@ -215,42 +197,36 @@ def _render_inline_matome_cta(
     message: str,
     button_key_suffix: str,
 ) -> None:
-    """各タブ内で「質問ごとにまとめる」を直接実行できるインラインCTA."""
+    """各タブ内で「質問ごとにまとめる」の実行を促すインラインバナー（ボタンなし）.
+
+    実行ボタンは「✏️ 編集・加工」タブのステップ 1 に一本化している。
+    """
     st.markdown(
         f'<div style="background:{_COLOR_WARNING}11;border:1px solid {_COLOR_WARNING}55;'
         f'border-left:4px solid {_COLOR_WARNING};padding:12px 16px;border-radius:8px;'
         f'margin:8px 0 12px 0;">'
         f'<div style="font-weight:600;color:#b45309;margin-bottom:4px;">'
         f'🎯 まず「質問ごとにまとめる」を実行してください</div>'
-        f'<div style="color:#475569;font-size:0.92rem;line-height:1.5;">{message}</div>'
+        f'<div style="color:#475569;font-size:0.92rem;line-height:1.55;">{message}'
+        f'<br><strong>「✏️ 編集・加工」タブのステップ 1</strong> から実行できます。</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
-    col_run, _ = st.columns([2, 5])
-    with col_run:
-        if st.button(
-            "✨ 質問ごとにまとめる を実行",
-            key=f"inline_matome_{button_key_suffix}_{idx}",
-            use_container_width=True,
-            type="primary",
-        ):
-            _apply_matome(idx, pf)
 
 
 def _render_matome_banner(idx: int, pf: dict) -> None:
-    """ファイルカード直下に「回答識別子を付与」CTAを表示する.
+    """ファイルカード直下に状態バナーを表示する（ボタンは置かない）.
 
-    [P.N] がまだ無い場合は強調表示し、ワンクリックで適用できる。
-    既に付与済みの場合は緑色のステータスバッジを表示する。
+    実行ボタンは「✏️ 編集・加工」タブのステップ1に一本化している。
     """
     if has_respondent_id(pf["current_text"]):
         st.markdown(
             f'<div style="background:{_COLOR_POSITIVE}11;border:1px solid {_COLOR_POSITIVE}55;'
             f'border-left:4px solid {_COLOR_POSITIVE};padding:10px 16px;border-radius:8px;'
-            f'margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;">'
-            f'<div><strong style="color:#15803d;">✅ 回答識別子が付与されています</strong>'
+            f'margin-bottom:14px;">'
+            f'<strong style="color:#15803d;">✅ 回答識別子が付与されています</strong>'
             f'<span style="color:#475569;margin-left:10px;font-size:0.9rem;">'
-            f'回答者ビュー / 定量分析 / Excel 出力など全ての機能をご利用いただけます。</span></div>'
+            f'回答者ビュー / 定量分析 / Excel 出力など全ての機能をご利用いただけます。</span>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -260,24 +236,14 @@ def _render_matome_banner(idx: int, pf: dict) -> None:
         f'<div style="background:{_COLOR_WARNING}11;border:1px solid {_COLOR_WARNING}55;'
         f'border-left:4px solid {_COLOR_WARNING};padding:14px 18px;border-radius:8px;'
         f'margin-bottom:14px;">'
-        f'<div style="font-weight:600;color:#b45309;font-size:1.05rem;margin-bottom:4px;">'
-        f'🎯 ステップ 1: まず「質問ごとにまとめる」を実行してください</div>'
-        f'<div style="color:#475569;font-size:0.92rem;line-height:1.5;">'
-        f'回答者単位ビュー・定量分析・Excel 出力など多くの機能で、'
-        f'<strong>[P.N] 形式の回答者識別子</strong>が必要です。'
-        f'この操作で印字された質問ごとに回答を集約し、回答者ごとに識別子を自動付与します。'
+        f'<div style="font-weight:600;color:#b45309;font-size:1.02rem;margin-bottom:4px;">'
+        f'🎯 まだ「質問ごとにまとめる」が実行されていません</div>'
+        f'<div style="color:#475569;font-size:0.92rem;line-height:1.55;">'
+        f'回答者単位ビュー・定量分析・Excel 出力など多くの機能で <strong>[P.N] 形式の回答者識別子</strong>が必要です。'
+        f'下の <strong>「✏️ 編集・加工」タブ → ステップ 1</strong> から実行してください。'
         f'</div></div>',
         unsafe_allow_html=True,
     )
-    col_run, col_spacer = st.columns([2, 5])
-    with col_run:
-        if st.button(
-            "✨ 質問ごとにまとめる を実行",
-            key=f"matome_cta_{idx}",
-            use_container_width=True,
-            type="primary",
-        ):
-            _apply_matome(idx, pf)
 
 # ---------------------------------------------------------------------------
 # Session state helpers
