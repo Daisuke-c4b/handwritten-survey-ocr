@@ -1,5 +1,11 @@
 import time
 import requests
+from gemini_api import (
+    GeminiApiError,
+    parse_generate_content_response,
+    raise_for_gemini_response,
+    wrap_gemini_exception,
+)
 from ocr_processor import _get_api_key, MODEL_NAME
 from cost_tracker import TimedCall
 
@@ -255,32 +261,26 @@ class TextEditor:
                         json=payload,
                         timeout=120,
                     )
-                    res.raise_for_status()
-                    text = (
-                        res.json()
-                        .get("candidates", [{}])[0]
-                        .get("content", {})
-                        .get("parts", [{}])[0]
-                        .get("text", "")
-                    ).strip()
+                    raise_for_gemini_response(res, MODEL_NAME)
+                    text = parse_generate_content_response(res.json())
                     tc.set_output(text)
                     return text
                 except requests.HTTPError as e:
-                    last_err = e
+                    last_err = wrap_gemini_exception(e, MODEL_NAME)
                     status = e.response.status_code if e.response is not None else 0
                     if status >= 500 and attempt < max_retries - 1:
                         wait = 2 ** attempt
                         time.sleep(wait)
                         continue
-                    tc.mark_error(e)
-                    raise
+                    tc.mark_error(last_err)
+                    raise last_err from e
                 except Exception as e:
-                    last_err = e
+                    last_err = wrap_gemini_exception(e, MODEL_NAME)
                     if attempt < max_retries - 1:
                         time.sleep(2 ** attempt)
                         continue
-                    tc.mark_error(e)
-                    raise
+                    tc.mark_error(last_err)
+                    raise last_err from e
 
             tc.mark_error(last_err)
             raise last_err

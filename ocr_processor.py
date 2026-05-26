@@ -9,18 +9,33 @@ import base64
 import numpy as np
 
 from cost_tracker import TimedCall
+from gemini_api import (
+    GeminiApiError,
+    parse_generate_content_response,
+    raise_for_gemini_response,
+    wrap_gemini_exception,
+)
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 APP_UPDATED = "2026-05-25"
 
-MODEL_NAME = "gemini-3.1-flash-lite-preview"
+MODEL_NAME = "gemini-3.1-flash-lite"
 MODEL_LABEL = "Gemini 3.1 Flash-Lite"
 MODEL_DESCRIPTION = (
-    "Gemini 3 シリーズのパフォーマンスと品質を備えた、"
-    "大量のトラフィックをスピード重視で処理するモデル。"
+    "Gemini 3 シリーズの安定版 Flash-Lite。"
+    "大規模モデルに匹敵するパフォーマンスを、わずかな費用で実現します。"
 )
 
 CHANGELOG: list[dict] = [
+    {
+        "version": "1.7.1",
+        "date": "2026-05-25",
+        "changes": [
+            "使用モデルを gemini-3.1-flash-lite-preview から gemini-3.1-flash-lite（安定版）へ変更",
+            "Gemini API エラー時に HTTP ステータス・モデル名・API 詳細をユーザーに表示",
+            "モデル移行の可能性を案内し、公式モデル一覧ドキュメントへのリンクを表示",
+        ],
+    },
     {
         "version": "1.7.0",
         "date": "2026-05-25",
@@ -167,24 +182,20 @@ def extract_texts_from_screenshots(image_bytes_list: list[bytes]) -> list[str]:
                         json=payload,
                         timeout=60,
                     )
-                    res.raise_for_status()
-                    text = (
-                        res.json()
-                        .get("candidates", [{}])[0]
-                        .get("content", {})
-                        .get("parts", [{}])[0]
-                        .get("text", "")
-                    )
+                    raise_for_gemini_response(res, MODEL_NAME)
+                    text = parse_generate_content_response(res.json())
                     tc.set_output(text or "")
                 except Exception as _e_cost:
                     tc.mark_error(_e_cost)
-                    raise
+                    raise wrap_gemini_exception(_e_cost, MODEL_NAME) from _e_cost
             for line in text.strip().splitlines():
                 line = line.strip()
                 if line:
                     extracted.append(line)
+        except GeminiApiError:
+            raise
         except Exception as e:
-            print(f"除外テキスト抽出エラー: {e}")
+            raise wrap_gemini_exception(e, MODEL_NAME) from e
     return extracted
 
 
@@ -731,6 +742,10 @@ class OCRProcessor:
             except Exception as e:
                 error_msg = str(e)
                 print(f"ページ {page_num}: エラー発生 - {error_msg}")
+                api_err = wrap_gemini_exception(e, self.model_name)
+                # モデル未提供・認可エラー等は即座に上位へ伝播（ユーザーに表示させる）
+                if api_err.status_code in (400, 403, 404):
+                    raise api_err from e
                 # If quota exceeded, don't retry
                 if "429" in error_msg or "quota" in error_msg.lower():
                     return f"ページ {page_num}: OCRエラー - {str(e)}"
@@ -1274,19 +1289,13 @@ Q<番号>: <該当する回答テキスト1行のみ>
                     json=payload,
                     timeout=timeout,
                 )
-                res.raise_for_status()
-                text = (
-                    res.json()
-                    .get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                ).strip()
+                raise_for_gemini_response(res, self.model_name)
+                text = parse_generate_content_response(res.json())
                 tc.set_output(text)
                 return text
             except Exception as e:
                 tc.mark_error(e)
-                raise
+                raise wrap_gemini_exception(e, self.model_name) from e
     
     def _parse_questions_from_text(self, text):
         """Parse questions and answers from text"""

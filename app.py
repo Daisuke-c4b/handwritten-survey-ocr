@@ -38,6 +38,7 @@ import cost_tracker
 import survey_analyzer
 import excel_exporter
 from diff_viewer import generate_diff_html
+from gemini_api import GEMINI_MODELS_DOC_URL, GeminiApiError, wrap_gemini_exception
 
 # ---------------------------------------------------------------------------
 # Theme / visual constants
@@ -149,6 +150,29 @@ def _inject_global_css() -> None:
     st.markdown(_GLOBAL_CSS, unsafe_allow_html=True)
 
 
+def _show_api_error(context: str, err: Exception) -> None:
+    """Gemini API エラーをユーザー向けに表示する."""
+    api_err = err if isinstance(err, GeminiApiError) else wrap_gemini_exception(err, MODEL_NAME)
+    st.error(f"❌ {context}")
+    st.markdown(f"**{api_err}**")
+    meta: list[str] = []
+    if api_err.status_code is not None:
+        meta.append(f"HTTP {api_err.status_code}")
+    if api_err.model_name:
+        meta.append(f"使用中モデル: `{api_err.model_name}`")
+    if meta:
+        st.caption(" / ".join(meta))
+    if api_err.api_detail and api_err.api_detail not in str(api_err):
+        st.code(api_err.api_detail, language=None)
+    st.warning(
+        "Gemini API のモデル名や提供状況が変更された可能性があります。"
+        "最新の利用可能モデルを公式ドキュメントでご確認ください。"
+    )
+    st.markdown(
+        f"📖 [Gemini API モデル一覧（公式ドキュメント）]({GEMINI_MODELS_DOC_URL})"
+    )
+
+
 def _metric_card(label: str, value, sub: str = "", color: str = _COLOR_PRIMARY) -> str:
     """カラーアクセント付きのメトリクスカード HTML を返す."""
     return (
@@ -187,7 +211,7 @@ def _apply_matome(idx: int, pf: dict, rerun: bool = True) -> bool:
             st.rerun()
         return True
     except Exception as e:
-        st.error(f"質問ごとにまとめる処理でエラーが発生しました: {str(e)}")
+        _show_api_error("質問ごとにまとめる処理中にエラーが発生しました", e)
         return False
 
 
@@ -361,10 +385,16 @@ def _render_exclude_section() -> None:
 
             if st.button("🔍 テキストを読み取る", key="extract_btn", use_container_width=True):
                 with st.spinner("スクリーンショットからテキストを抽出中..."):
-                    img_bytes_list = [s.getvalue() for s in screenshots]
-                    extracted = extract_texts_from_screenshots(img_bytes_list)
-                    st.session_state.extracted_screenshot_texts = extracted
-                    _invalidate_processor()
+                    try:
+                        img_bytes_list = [s.getvalue() for s in screenshots]
+                        extracted = extract_texts_from_screenshots(img_bytes_list)
+                        st.session_state.extracted_screenshot_texts = extracted
+                        _invalidate_processor()
+                    except Exception as e:
+                        _show_api_error(
+                            "スクリーンショットからのテキスト読み取り中にエラーが発生しました",
+                            e,
+                        )
 
         if st.session_state.extracted_screenshot_texts:
             st.success(
@@ -564,7 +594,7 @@ def _render_proofread_section() -> None:
                 st.session_state.proofread_fixed_text = fixed
                 st.rerun()
             except Exception as e:
-                st.error(f"校正エラー: {str(e)}")
+                _show_api_error("校正チェック中にエラーが発生しました", e)
 
     if st.session_state.proofread_result:
         st.markdown("**校正結果（指摘レポート）**")
@@ -636,12 +666,15 @@ def _process_files(uploaded_files: list) -> None:
                 ocr_mode=st.session_state.ocr_mode,
             )
             st.session_state.ocr_processor = ocr_processor
-        except Exception as e:
-            st.error(f"Gemini API の初期化に失敗しました: {str(e)}")
+        except ValueError as e:
+            st.error(str(e))
             st.error(
                 "GEMINI_API_KEY が正しく設定されているか、"
                 "または .streamlit/secrets.toml に設定されているか確認してください。"
             )
+            return
+        except Exception as e:
+            _show_api_error("Gemini API の初期化に失敗しました", e)
             return
 
     progress_bar = st.progress(0)
@@ -714,7 +747,7 @@ def _process_files(uploaded_files: list) -> None:
                     os.unlink(tmp_path)
 
         except Exception as e:
-            st.error(f"❌ {uploaded_file.name}: エラーが発生しました - {str(e)}")
+            _show_api_error(f"{uploaded_file.name} の処理中にエラーが発生しました", e)
 
     progress_bar.progress(1.0)
     status_text.text("すべての処理が完了しました！")
@@ -825,7 +858,7 @@ def _render_quant_summary(idx: int, pf: dict) -> None:
                 pf[summary_key] = summary
                 st.rerun()
             except Exception as e:
-                st.error(f"定量サマリー生成エラー: {str(e)}")
+                _show_api_error("定量サマリー生成中にエラーが発生しました", e)
     with col_clear:
         if pf.get(summary_key):
             if st.button("🗑️ クリア", key=f"quant_clear_{idx}", use_container_width=True):
@@ -1316,7 +1349,7 @@ def _render_auto_template_section() -> None:
                 st.session_state.auto_template_candidates = items
                 st.rerun()
             except Exception as e:
-                st.error(f"抽出エラー: {str(e)}")
+                _show_api_error("テンプレート候補の抽出中にエラーが発生しました", e)
     with col_clear:
         if st.session_state.auto_template_candidates:
             if st.button("🗑️ クリア", key="auto_tmpl_clear", use_container_width=True):
@@ -1548,7 +1581,7 @@ def _render_edit_tab(idx: int, pf: dict) -> None:
                         st.session_state[ver_key] += 1
                         st.rerun()
                     except Exception as e:
-                        st.error(f"加工エラー: {str(e)}")
+                        _show_api_error("テキスト加工中にエラーが発生しました", e)
         with col_reset:
             if st.button(
                 "↩️ 元に戻す",
@@ -1646,7 +1679,7 @@ def _render_download_tab(idx: int, pf: dict, doc_generator: DocumentGenerator) -
             st.session_state.survey_analysis = analysis
             st.rerun()
         except Exception as e:
-            st.error(f"分析エラー: {str(e)}")
+            _show_api_error("アンケート分析中にエラーが発生しました", e)
 
     if st.session_state.survey_analysis:
         st.markdown("**分析結果**")
