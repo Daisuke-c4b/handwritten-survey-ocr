@@ -16,8 +16,8 @@ from gemini_api import (
     wrap_gemini_exception,
 )
 
-APP_VERSION = "1.7.1"
-APP_UPDATED = "2026-05-25"
+APP_VERSION = "1.7.2"
+APP_UPDATED = "2026-05-26"
 
 MODEL_NAME = "gemini-3.1-flash-lite"
 MODEL_LABEL = "Gemini 3.1 Flash-Lite"
@@ -27,6 +27,15 @@ MODEL_DESCRIPTION = (
 )
 
 CHANGELOG: list[dict] = [
+    {
+        "version": "1.7.2",
+        "date": "2026-05-26",
+        "changes": [
+            "複数ページPDF: 各ページで印字質問を省略せず Q1/Q2 形式で全文文字起こししてから質問別に集約",
+            "2ページ目以降は1ページ目の質問一覧を参照し、設問欠落を防止",
+            "全ページで設問が揃っている場合はローカル集約を優先し、回答の取り違えを低減",
+        ],
+    },
     {
         "version": "1.7.1",
         "date": "2026-05-25",
@@ -223,10 +232,49 @@ class OCRProcessor:
         items = "\n".join(f"  - 「{t}」" for t in self.exclude_texts)
         return f"""
 6. **文字起こし対象外テキスト（重要）**
-   以下の文字列はアンケート用紙に印刷されたタイトルや質問文など、文字起こし不要のテキストです。
+   以下の文字列はアンケート用紙に印刷されたタイトル・ヘッダーなど、文字起こし不要のテキストです。
    これらの文字列が画像内に見つかった場合、出力から**完全に除外**してください。
    部分一致でも該当する場合は除外してください。
+   **ただし**、設問（Q1/Q2 等の質問文）でその下に手書き回答欄があるものは、
+   上記リストに該当しても**必ず文字起こしに含めてください**（設問の省略は禁止）。
 {items}
+"""
+
+    def _build_page_ocr_prompt(
+        self,
+        page_num: int,
+        total_pages: int = 1,
+        reference_questions: dict[int, str] | None = None,
+    ) -> str:
+        """ページ単位 OCR 用プロンプト（複数ページ PDF では設問省略を禁止）."""
+        base = self.ocr_prompt
+        if total_pages <= 1:
+            return base
+
+        ref_section = ""
+        if reference_questions:
+            ref_lines = "\n".join(
+                f"Q{q_num}: {q_text}"
+                for q_num, q_text in sorted(reference_questions.items())
+            )
+            ref_section = f"""
+**参考：このアンケートの質問一覧（1ページ目より）**
+{ref_lines}
+
+- このページにも上記と同じ印字質問が存在します。
+- 見出しは `Q1:`, `Q2:` … の形式で、**すべて省略せず**出力してください。
+"""
+
+        return f"""{base}
+
+**複数ページPDF — ページ {page_num}/{total_pages} の追加ルール（厳守）**
+- 全回答者に同じ印字質問が印刷されたアンケート用紙です。
+- 用紙上に存在する**すべての印字質問**を `Q1: <質問文>`, `Q2: <質問文>` … の形式で出力してください。
+- **質問文の省略・スキップ・要約は禁止**です。回答だけを並べる形式も禁止です。
+- 各質問見出しの直下に、その質問に対する**手書き回答のみ**を記載してください。
+- 手書き回答が空欄の質問も、質問見出しは必ず出力し、回答は「（無回答）」と記載してください。
+- このページは回答者 {page_num} 人目に相当します（後で集約時に [P.{page_num}] として識別されます）。
+{ref_section}
 """
 
     def _build_accurate_prompt(self) -> str:
@@ -625,8 +673,15 @@ class OCRProcessor:
         
         return True
     
-    def _extract_text_from_image(self, image, page_num, resize_on_failure=True):
+    def _extract_text_from_image(
+        self,
+        image,
+        page_num,
+        resize_on_failure=True,
+        ocr_prompt: str | None = None,
+    ):
         """Extract text from image using Gemini AI with automatic resize retry on failure"""
+        prompt = ocr_prompt if ocr_prompt is not None else self.ocr_prompt
         # First, ensure image doesn't exceed API limits
         image = self._ensure_max_size(image, max_dimension=4096)
         
@@ -665,7 +720,7 @@ class OCRProcessor:
                     "contents": [
                         {
                             "parts": [
-                                {"text": self.ocr_prompt},
+                                {"text": prompt},
                                 {
                                     "inline_data": {
                                         "mime_type": "image/png",
@@ -681,7 +736,7 @@ class OCRProcessor:
                 with TimedCall(
                     purpose=f"OCR: 個別ページ (P.{page_num})",
                     model=self.model_name,
-                    input_chars=len(self.ocr_prompt),
+                    input_chars=len(prompt),
                     image_bytes=len(img_byte_arr),
                 ) as tc:
                     try:
@@ -844,16 +899,27 @@ class OCRProcessor:
     
     def _process_pages_individually(self, images_with_pages):
         """Process each page individually with retry logic for maximum accuracy"""
+        total_pages = len(images_with_pages)
         all_page_results = []
-        
-        for image, page_num in images_with_pages:
-            # Try multiple extraction attempts for each page
-            page_text = self._extract_with_retry(image, page_num)
+        reference_questions: dict[int, str] = {}
+
+        for idx, (image, page_num) in enumerate(images_with_pages):
+            ref = reference_questions if idx > 0 and reference_questions else None
+            page_text = self._extract_with_retry(
+                image,
+                page_num,
+                total_pages=total_pages,
+                reference_questions=ref,
+            )
             if page_text and page_text.strip():
                 all_page_results.append({
                     'page_num': page_num,
-                    'text': page_text.strip()
+                    'text': page_text.strip(),
                 })
+                for q_num, q_text, _ in self._parse_questions_from_text(page_text):
+                    existing = reference_questions.get(q_num, "")
+                    if len(q_text) > len(existing):
+                        reference_questions[q_num] = q_text
         
         # If no results, return empty string
         if not all_page_results:
@@ -871,10 +937,24 @@ class OCRProcessor:
         
         return result
     
-    def _extract_with_retry(self, image, page_num, max_retries=1):
+    def _extract_with_retry(
+        self,
+        image,
+        page_num,
+        max_retries=1,
+        total_pages: int = 1,
+        reference_questions: dict[int, str] | None = None,
+    ):
         """Extract text with multiple attempts and automatic resize on failure"""
-        # Use _extract_text_from_image which already has resize logic
-        result = self._extract_text_from_image(image, page_num, resize_on_failure=True)
+        page_prompt = self._build_page_ocr_prompt(
+            page_num, total_pages, reference_questions
+        )
+        result = self._extract_text_from_image(
+            image,
+            page_num,
+            resize_on_failure=True,
+            ocr_prompt=page_prompt,
+        )
         
         # If result is valid, return it
         if self._is_text_valid(result):
@@ -904,13 +984,12 @@ class OCRProcessor:
                     if self.ocr_mode == "proofread" else ""
                 )
                 individual_prompt = f"""
-{self.ocr_prompt}
+{page_prompt}
 
-**ページ {page_num} の詳細分析：**
-- この1ページのみに集中してください
-- 書かれた文字を一字一句正確に読み取ってください
-- 印刷された質問文は1度だけ文字起こしし、その質問の直下に手書きの回答をまとめる
-- 同一の質問が複数回出現しても質問文は1度のみ出力し、各回答を質問の下にまとめて列挙する{proofread_hint}
+**ページ {page_num} の再試行（より厳密に）：**
+- 用紙上の**すべての印字質問**を `Q1:`, `Q2:` … 形式で省略なく出力してください。
+- 各質問の直下に手書き回答を配置してください（質問と回答の対応を絶対に取り違えない）。
+- 質問を1つにまとめたり、回答だけを並べたりしないでください。{proofread_hint}
 
 画像を慎重に分析し、印刷質問文と手書き回答を正確に文字起こししてください：
 """
@@ -988,20 +1067,20 @@ class OCRProcessor:
     def _consolidate_questions_from_pages(self, page_results):
         """Consolidate questions and answers from multiple pages.
 
-        改良ポイント (v1.7.0):
-        - 複数ページ PDF では Gemini に「全ページ一括統合」を依頼することで
-          OCR が一部質問を欠落しても、canonical 質問の特定と回答の正確な分類を実現する。
-        - 単一ページのときはローカルパースで十分なので追加 API 呼び出しは行わない。
-        - フォールバックとして従来のローカル集約 + 質問再割り当てロジックも保持する。
+        改良ポイント (v1.7.2):
+        - 各ページ OCR で Q1/Q2 形式の設問を省略せず取得することを前提とする。
+        - 全ページで設問が揃っている場合はローカル集約のみ（回答の取り違えを防止）。
+        - 設問欠落がある場合のみ Gemini 統合 → ローカル集約の順でフォールバック。
         """
         if not page_results:
             return ""
 
-        # --- 単一ページならローカル集約で完結 ---
         if len(page_results) == 1:
             return self._local_consolidate(page_results)
 
-        # --- 複数ページは Gemini で全ページ一括統合（最重要のロバストパス） ---
+        if self._pages_have_full_question_coverage(page_results):
+            return self._local_consolidate(page_results)
+
         try:
             unified = self._unified_consolidate_via_gemini(page_results)
             if unified and unified.strip() and "Q1" in unified.upper().replace("Ｑ", "Q"):
@@ -1009,8 +1088,30 @@ class OCRProcessor:
         except Exception as e:
             print(f"統合集約が失敗、ローカル集約にフォールバック: {e}")
 
-        # --- フォールバック: ローカル集約 + 再割り当て ---
         return self._local_consolidate(page_results)
+
+    def _build_canonical_questions(self, page_results: list[dict]) -> dict[int, str]:
+        """全ページから canonical な質問文を集約（最長表記を採用）."""
+        canonical: dict[int, str] = {}
+        for pr in page_results:
+            for q_num, q_text, _ in self._parse_questions_from_text(pr.get('text', '')):
+                existing = canonical.get(q_num, "")
+                if not existing or len(q_text) > len(existing):
+                    canonical[q_num] = q_text
+        return canonical
+
+    def _pages_have_full_question_coverage(self, page_results: list[dict]) -> bool:
+        """全ページで canonical 設問が OCR 結果に含まれているか."""
+        canonical = self._build_canonical_questions(page_results)
+        if len(canonical) < 1:
+            return False
+        required = set(canonical.keys())
+        for pr in page_results:
+            parsed = self._parse_questions_from_text(pr.get('text', ''))
+            page_q_nums = {q_num for q_num, _, _ in parsed}
+            if not required.issubset(page_q_nums):
+                return False
+        return True
 
     def _local_consolidate(self, page_results):
         """各ページをローカルパースし、不足分は Gemini に再割り当てさせる従来パス."""
@@ -1030,12 +1131,7 @@ class OCRProcessor:
             })
 
         # --- 2) canonical 質問文を集約（最長表記を採用）---
-        canonical_questions: dict[int, str] = {}
-        for pp in parsed_pages:
-            for q_num, q_text, _ in pp['questions']:
-                existing = canonical_questions.get(q_num, "")
-                if not existing or len(q_text) > len(existing):
-                    canonical_questions[q_num] = q_text
+        canonical_questions = self._build_canonical_questions(page_results)
 
         # canonical が無ければ最低限のフォールバック
         if not canonical_questions:
@@ -1136,22 +1232,25 @@ class OCRProcessor:
         prompt = f"""\
 あなたはアンケート集約の専門家です。以下は同一のアンケート用紙を複数の回答者が記入した
 複数ページの OCR 結果です。各ページは 1 名の回答者に相当し、ページ番号 = 回答者番号です。
+各ページは `Q1:`, `Q2:` … 形式で印字質問と手書き回答が記載されている想定ですが、
+一部ページで設問見出しの OCR 欠落がある可能性があります。
 
 【ページごとの OCR テキスト】
 {pages_section}
 
 【あなたのタスク】
-1. このアンケート用紙に印字されている **canonical な質問一覧** を確定してください。
-   - ある質問は一部のページで OCR 認識が欠落している可能性があります。
-   - 他のページから補完して、全ての質問の最も完全な表記を採用してください。
-   - 質問番号は元の用紙に従って Q1, Q2, ... の昇順で番号付けしてください。
-2. 各回答（手書きの内容）を **正しい質問の下** に分類してください。
+1. 各ページ内で **回答はそのページ内の質問見出し（Q1/Q2…）の直下に書かれていたもの** として扱い、
+   質問と回答の対応関係をページ内の並び順から厳密に復元してください。
+2. このアンケート用紙に印字されている **canonical な質問一覧** を確定してください。
+   - 欠落している設問見出しは他ページから補完し、最も完全な表記を採用してください。
+   - 質問番号は Q1, Q2, ... の昇順で番号付けしてください。
+3. 各回答（手書きの内容）を **正しい質問の下** に分類してください。
    - **絶対に質問の境界を超えて回答を混在させない**でください。
      Q2 の回答が Q1 に入る・Q1 の回答が Q2 に入るような取り違えは禁止です。
    - ページ {{N}} に書かれていた回答には、必ず先頭に `[P.{{N}}]` を付けてください。
    - 質問1だけ・質問2だけしか回答していない回答者がいても、その回答は該当質問の下にだけ配置してください。
-3. 該当する手書き回答がない質問の下には `・（無回答）` と 1 行だけ書いてください。
-4. **回答の取りこぼし禁止**: 各ページに書かれている手書きと思しき内容は、原則として
+4. 該当する手書き回答がない質問の下には `・（無回答）` と 1 行だけ書いてください。
+5. **回答の取りこぼし禁止**: 各ページに書かれている手書きと思しき内容は、原則として
    いずれかの質問の下に必ず配置してください（印字された質問文や見出しを回答として
    出力してはいけません。手書きと判別できないものは除外してください）。
 
@@ -1311,8 +1410,7 @@ Q<番号>: <該当する回答テキスト1行のみ>
                 continue
             
             # Check if line is a question
-            import re
-            q_match = re.match(r'^Q(\d+)[:：]\s*(.+)', line)
+            q_match = re.match(r'^(?:Q|質問)\s*(\d+)\s*[:：]\s*(.+)', line, re.IGNORECASE)
             if q_match:
                 # Save previous question if exists
                 if current_question and current_q_num:
