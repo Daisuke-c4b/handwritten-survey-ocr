@@ -16,7 +16,7 @@ from gemini_api import (
     wrap_gemini_exception,
 )
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.7.3"
 APP_UPDATED = "2026-05-26"
 
 DEFAULT_MODEL_ID = "gemini-3.1-flash-lite"
@@ -57,16 +57,6 @@ def get_model_config(model_id: str | None = None) -> dict[str, str]:
     }
 
 CHANGELOG: list[dict] = [
-    {
-        "version": "1.8.0",
-        "date": "2026-05-26",
-        "changes": [
-            "設問テンプレートの事前登録: OCR 時に Q1/Q2 一覧を参照し設問欠落を防止",
-            "編集タブに原画像とのインライン校正（ページ単位の修正反映）を追加",
-            "前回研修 vs 今回研修の Word アンケート比較機能を追加",
-            "README を現行機能に合わせて全面更新",
-        ],
-    },
     {
         "version": "1.7.3",
         "date": "2026-05-26",
@@ -268,7 +258,6 @@ class OCRProcessor:
         exclude_texts: list[str] | None = None,
         ocr_mode: str = "accurate",
         model_name: str | None = None,
-        template_questions: dict[int, str] | None = None,
     ):
         """Initialize Gemini AI for OCR processing"""
         self.api_key = _get_api_key()
@@ -278,26 +267,8 @@ class OCRProcessor:
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         self.exclude_texts = [t.strip() for t in (exclude_texts or []) if t.strip()]
         self.ocr_mode = ocr_mode
-        self.template_questions = {
-            int(k): v.strip()
-            for k, v in (template_questions or {}).items()
-            if v and str(v).strip()
-        }
 
         self.ocr_prompt = self._build_ocr_prompt()
-
-    def _merged_reference_questions(
-        self,
-        reference_questions: dict[int, str] | None,
-    ) -> dict[int, str]:
-        """事前登録テンプレートとページ参照を統合."""
-        merged = dict(self.template_questions)
-        if reference_questions:
-            for q_num, q_text in reference_questions.items():
-                existing = merged.get(q_num, "")
-                if not existing or len(q_text) > len(existing):
-                    merged[q_num] = q_text
-        return merged
 
     def _build_ocr_prompt(self) -> str:
         """Route to mode-specific prompt builder."""
@@ -328,38 +299,21 @@ class OCRProcessor:
     ) -> str:
         """ページ単位 OCR 用プロンプト（複数ページ PDF では設問省略を禁止）."""
         base = self.ocr_prompt
-        effective_ref = self._merged_reference_questions(reference_questions)
-
-        ref_section = ""
-        if effective_ref:
-            ref_lines = "\n".join(
-                f"Q{q_num}: {q_text}"
-                for q_num, q_text in sorted(effective_ref.items())
-            )
-            source = (
-                "事前登録された設問テンプレート"
-                if self.template_questions
-                else "1ページ目の OCR 結果"
-            )
-            ref_section = f"""
-**参考：このアンケートの質問一覧（{source}）**
-{ref_lines}
-
-- 用紙上の印字質問は上記と同一です。
-- 見出しは `Q1:`, `Q2:` … の形式で、**すべて省略せず**出力してください。
-"""
-
-        if total_pages <= 1 and not effective_ref:
+        if total_pages <= 1:
             return base
 
-        if total_pages <= 1 and effective_ref:
-            return f"""{base}
+        ref_section = ""
+        if reference_questions:
+            ref_lines = "\n".join(
+                f"Q{q_num}: {q_text}"
+                for q_num, q_text in sorted(reference_questions.items())
+            )
+            ref_section = f"""
+**参考：このアンケートの質問一覧（1ページ目より）**
+{ref_lines}
 
-**設問テンプレートに基づく追加ルール（厳守）**
-- 用紙上に存在する**すべての印字質問**を `Q1: <質問文>`, `Q2: <質問文>` … の形式で出力してください。
-- **質問文の省略・スキップ・要約は禁止**です。
-- 各質問見出しの直下に、その質問に対する**手書き回答のみ**を記載してください。
-{ref_section}
+- このページにも上記と同じ印字質問が存在します。
+- 見出しは `Q1:`, `Q2:` … の形式で、**すべて省略せず**出力してください。
 """
 
         return f"""{base}

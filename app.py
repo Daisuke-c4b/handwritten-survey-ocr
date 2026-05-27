@@ -26,17 +26,6 @@ from template_manager import (
     update_template,
     delete_template,
 )
-from question_template_manager import (
-    list_question_templates,
-    get_question_template,
-    questions_as_dict,
-    parse_questions_from_input,
-    format_questions_for_editor,
-    add_question_template,
-    delete_question_template,
-)
-from word_parser import extract_text_from_docx
-import training_comparison
 from text_editor import TextEditor, EDITING_MODES
 from utils import (
     validate_pdf,
@@ -167,15 +156,6 @@ def _get_gemini_model() -> str:
     if model_id not in GEMINI_MODELS:
         return DEFAULT_MODEL_ID
     return model_id
-
-
-def _get_active_template_questions() -> dict[int, str]:
-    """選択中の設問テンプレートを dict 形式で返す."""
-    name = st.session_state.get("active_question_template", "")
-    if not name:
-        return {}
-    tmpl = get_question_template(name)
-    return questions_as_dict(tmpl)
 
 
 def _create_text_editor() -> TextEditor:
@@ -347,11 +327,6 @@ _STATE_DEFAULTS: dict = {
     "proofread_result": "",
     "proofread_fixed_text": "",
     "auto_template_candidates": [],
-    "active_question_template": "",
-    "question_template_draft": "",
-    "training_compare_result": "",
-    "training_compare_prev_name": "",
-    "training_compare_curr_name": "",
 }
 
 
@@ -585,123 +560,6 @@ def _render_template_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Question template (pre-registration)
-# ---------------------------------------------------------------------------
-
-def _render_question_template_section() -> None:
-    """設問テンプレートの選択・編集・保存."""
-    st.caption(
-        "OCR 前に Q1/Q2 の設問文を登録しておくと、文字起こし時に設問欠落を防ぎやすくなります。"
-    )
-    templates = list_question_templates()
-    tmpl_names = ["（なし）"] + [t["name"] for t in templates]
-    current = st.session_state.get("active_question_template", "")
-    try:
-        default_idx = tmpl_names.index(current) if current in tmpl_names else 0
-    except ValueError:
-        default_idx = 0
-
-    selected = st.selectbox(
-        "使用中の設問テンプレート",
-        options=tmpl_names,
-        index=default_idx,
-        key="active_question_template_select",
-    )
-    new_active = "" if selected == "（なし）" else selected
-    if new_active != st.session_state.active_question_template:
-        st.session_state.active_question_template = new_active
-        _invalidate_processor()
-
-    if new_active:
-        qs = _get_active_template_questions()
-        st.success(f"「{new_active}」を使用中（{len(qs)} 設問）")
-        with st.expander("設問一覧を確認", expanded=False):
-            st.code(format_questions_for_editor(qs), language=None)
-
-    st.markdown("##### 設問を登録・編集")
-    draft = st.text_area(
-        "設問入力（1 設問 1 行）",
-        value=st.session_state.question_template_draft,
-        height=160,
-        placeholder="Q1: 本講座で印象に残ったことは？\nQ2: 改善してほしい点は？",
-        key="question_template_draft_area",
-        label_visibility="collapsed",
-    )
-    if draft != st.session_state.question_template_draft:
-        st.session_state.question_template_draft = draft
-
-    parsed = parse_questions_from_input(draft)
-    if parsed:
-        st.caption(f"認識: {len(parsed)} 設問")
-
-    save_name = st.text_input(
-        "保存名",
-        value="",
-        placeholder="例: 研修後アンケート2026",
-        key="question_template_save_name",
-    )
-    if st.button("💾 設問テンプレートを保存して使用", key="qtmpl_save", use_container_width=True):
-        if not save_name.strip():
-            st.warning("保存名を入力してください。")
-        elif not parsed:
-            st.warning("設問を Q1: 形式で入力してください。")
-        else:
-            try:
-                add_question_template(save_name.strip(), parsed)
-                st.session_state.active_question_template = save_name.strip()
-                _invalidate_processor()
-                st.success(f"「{save_name.strip()}」を保存し、使用中に設定しました")
-                st.rerun()
-            except ValueError as e:
-                st.error(str(e))
-
-    if templates:
-        st.divider()
-        st.markdown("##### 保存済みテンプレート")
-        for t in templates:
-            c1, c2, c3 = st.columns([3, 1, 1])
-            with c1:
-                st.markdown(f"**{t['name']}**（{len(t.get('questions') or {})} 設問）")
-            with c2:
-                if st.button("読込", key=f"qtmpl_load_{t['name']}", use_container_width=True):
-                    st.session_state.question_template_draft = format_questions_for_editor(
-                        questions_as_dict(t)
-                    )
-                    st.session_state.active_question_template = t["name"]
-                    _invalidate_processor()
-                    st.rerun()
-            with c3:
-                if st.button("削除", key=f"qtmpl_del_{t['name']}", use_container_width=True):
-                    delete_question_template(t["name"])
-                    if st.session_state.active_question_template == t["name"]:
-                        st.session_state.active_question_template = ""
-                        _invalidate_processor()
-                    st.rerun()
-
-    if st.session_state.processed_files:
-        st.divider()
-        st.markdown("##### 処理結果から設問を取り込む")
-        file_names = [pf["filename"] for pf in st.session_state.processed_files]
-        src_file = st.selectbox(
-            "取り込み元",
-            options=file_names,
-            key="qtmpl_import_file",
-        )
-        if st.button("📥 集約結果から設問を抽出", key="qtmpl_import_btn"):
-            pf = next(
-                p for p in st.session_state.processed_files if p["filename"] == src_file
-            )
-            parsed_q = survey_analyzer.parse_consolidated_text(pf["current_text"])
-            if not parsed_q:
-                st.warning("質問ヘッダ（Q1: 等）が見つかりません。先に「質問ごとにまとめる」を実行してください。")
-            else:
-                qs = {q.q_num: q.q_text for q in parsed_q}
-                st.session_state.question_template_draft = format_questions_for_editor(qs)
-                st.success(f"{len(qs)} 設問を入力欄に取り込みました")
-                st.rerun()
-
-
-# ---------------------------------------------------------------------------
 # Collect all exclude texts
 # ---------------------------------------------------------------------------
 
@@ -852,7 +710,6 @@ def _process_files(uploaded_files: list) -> None:
                 exclude_texts=_collect_exclude_texts(),
                 ocr_mode=st.session_state.ocr_mode,
                 model_name=_get_gemini_model(),
-                template_questions=_get_active_template_questions(),
             )
             st.session_state.ocr_processor = ocr_processor
         except ValueError as e:
@@ -1665,58 +1522,6 @@ def _render_file_tabs(idx: int, pf: dict, doc_generator: DocumentGenerator) -> N
         _render_download_tab(idx, pf, doc_generator)
 
 
-def _render_inline_image_proofread(idx: int, pf: dict, ver_key: str) -> None:
-    """原画像とページ抜粋を並べてインライン校正."""
-    page_images = pf.get("page_images") or []
-    page_options = [pnum for _b, pnum in page_images]
-    selected = st.selectbox(
-        "校正するページ",
-        options=page_options,
-        key=f"inline_page_{idx}",
-    )
-    img_bytes = next((b for b, p in page_images if p == selected), None)
-    snippet = _extract_page_snippet(pf["current_text"], selected)
-
-    col_img, col_edit = st.columns([5, 5], gap="large")
-    with col_img:
-        st.markdown(f"**📄 ページ {selected} の原画像**")
-        if img_bytes:
-            st.image(img_bytes, use_container_width=True)
-        else:
-            st.warning("画像がありません。")
-    with col_edit:
-        st.markdown(f"**✏️ ページ {selected} の文字起こし（編集可）**")
-        st.caption("原画像を見ながら修正し、「このページの修正を反映」で全体テキストに適用します。")
-        edited_snippet = st.text_area(
-            "ページ抜粋",
-            value=snippet,
-            height=480,
-            key=f"inline_snippet_{idx}_{selected}",
-            label_visibility="collapsed",
-        )
-        if st.button(
-            "💾 このページの修正を反映",
-            key=f"inline_apply_{idx}_{selected}",
-            type="primary",
-            use_container_width=True,
-        ):
-            if has_respondent_id(pf["current_text"]):
-                pf["current_text"] = survey_analyzer.merge_page_snippet_into_consolidated(
-                    pf["current_text"],
-                    selected,
-                    edited_snippet,
-                )
-            else:
-                st.warning(
-                    "集約形式（[P.N] 付き）でないため、ページ単位の反映はできません。"
-                    "先に「質問ごとにまとめる」を実行するか、全体テキストを直接編集してください。"
-                )
-                return
-            st.session_state[ver_key] = st.session_state.get(ver_key, 0) + 1
-            st.success(f"ページ {selected} の修正を反映しました")
-            st.rerun()
-
-
 def _render_edit_tab(idx: int, pf: dict) -> None:
     """文字起こしテキストの編集・加工 UI.
 
@@ -1730,47 +1535,21 @@ def _render_edit_tab(idx: int, pf: dict) -> None:
 
     col_text, col_tools = st.columns([3, 2], gap="large")
 
-    page_images = pf.get("page_images") or []
-    inline_available = bool(page_images)
-    use_inline = False
-    if inline_available:
-        use_inline = st.checkbox(
-            "🖼️ 原画像と並べて校正（インライン）",
-            value=False,
-            key=f"inline_mode_{idx}",
-            help="原画像を見ながら、ページ単位で文字起こしを修正できます。",
-        )
-
     with col_text:
-        if use_inline:
-            _render_inline_image_proofread(idx, pf, ver_key)
-            with st.expander("📄 全体テキストを編集", expanded=False):
-                edited = st.text_area(
-                    "文字起こし結果（全体）",
-                    value=pf["current_text"],
-                    height=280,
-                    key=f"text_area_{idx}_v{ver}_full",
-                    label_visibility="collapsed",
-                )
-                if edited != pf["current_text"]:
-                    pf["current_text"] = edited
-        else:
-            st.markdown("**✏️ 文字起こし結果**")
-            st.caption(
-                "テキストエリアを直接クリックして編集できます。"
-                "加工後の結果もここに反映されます。"
-            )
-            edited = st.text_area(
-                "文字起こし結果",
-                value=pf["current_text"],
-                height=520,
-                key=f"text_area_{idx}_v{ver}",
-                label_visibility="collapsed",
-            )
-            if edited != pf["current_text"]:
-                pf["current_text"] = edited
-        if inline_available and not use_inline:
-            st.caption("💡 原画像を見ながら校正する場合は上のチェックボックスをオンにしてください。")
+        st.markdown("**✏️ 文字起こし結果**")
+        st.caption(
+            "テキストエリアを直接クリックして編集できます。"
+            "加工後の結果もここに反映されます。"
+        )
+        edited = st.text_area(
+            "文字起こし結果",
+            value=pf["current_text"],
+            height=520,
+            key=f"text_area_{idx}_v{ver}",
+            label_visibility="collapsed",
+        )
+        if edited != pf["current_text"]:
+            pf["current_text"] = edited
 
     with col_tools:
         # ---- プライマリ: 質問ごとにまとめる ----
@@ -2022,12 +1801,11 @@ def main():
     st.markdown('<div style="margin-bottom: 20px;"></div>', unsafe_allow_html=True)
 
     # ---- Main tabs ----
-    tab_upload, tab_proof, tab_template, tab_compare, tab_cost, tab_about = st.tabs(
+    tab_upload, tab_proof, tab_template, tab_cost, tab_about = st.tabs(
         [
             "📁 アップロード & 結果",
             "📝 文字校正チェック",
             "🪄 設問テンプレート生成",
-            "📈 研修比較",
             "💰 API 利用状況",
             "ℹ️ アプリ情報",
         ]
@@ -2041,9 +1819,6 @@ def main():
 
     with tab_template:
         _render_template_section_tab()
-
-    with tab_compare:
-        _render_training_compare_tab()
 
     with tab_cost:
         _render_cost_tab()
@@ -2065,10 +1840,6 @@ def _render_sidebar() -> None:
             "文字起こし不要のテキストを指定できます。"
         )
         _render_exclude_section()
-
-        st.markdown("---")
-        st.markdown("### 📋 設問テンプレート")
-        _render_question_template_section()
 
         st.markdown("---")
         with st.expander("ℹ️ 使用モデル情報", expanded=False):
@@ -2130,83 +1901,6 @@ def _render_template_section_tab() -> None:
 def _render_cost_tab() -> None:
     st.subheader("💰 API 利用状況・処理時間")
     _render_cost_dashboard()
-
-
-def _render_training_compare_tab() -> None:
-    """前回研修 vs 今回研修の Word アンケート比較."""
-    st.subheader("📈 前回研修との比較")
-    st.caption(
-        "前回・今回の研修アンケート Word ファイル（.docx）をアップロードし、"
-        "傾向の変化と改善示唆を AI がレポートします。"
-        "「質問ごとにまとめた」後の Word 出力を使うと精度が上がります。"
-    )
-
-    col_prev, col_curr = st.columns(2)
-    with col_prev:
-        st.markdown("**📁 前回研修のアンケート（Word）**")
-        prev_file = st.file_uploader(
-            "前回 Word",
-            type=["docx"],
-            key="training_compare_prev",
-            label_visibility="collapsed",
-        )
-    with col_curr:
-        st.markdown("**📁 今回研修のアンケート（Word）**")
-        curr_file = st.file_uploader(
-            "今回 Word",
-            type=["docx"],
-            key="training_compare_curr",
-            label_visibility="collapsed",
-        )
-
-    if st.button(
-        "🔍 比較レポートを生成",
-        type="primary",
-        use_container_width=True,
-        key="training_compare_run",
-    ):
-        if not prev_file or not curr_file:
-            st.warning("前回・今回の両方の Word ファイルをアップロードしてください。")
-        else:
-            try:
-                prev_text = extract_text_from_docx(prev_file.getvalue())
-                curr_text = extract_text_from_docx(curr_file.getvalue())
-                if not prev_text.strip() or not curr_text.strip():
-                    st.warning("Word ファイルからテキストを読み取れませんでした。")
-                else:
-                    editor = _create_text_editor()
-                    with st.spinner("前回と今回のアンケートを比較分析中..."):
-                        result = training_comparison.generate_training_comparison(
-                            prev_text,
-                            curr_text,
-                            editor,
-                        )
-                    st.session_state.training_compare_result = result
-                    st.session_state.training_compare_prev_name = prev_file.name
-                    st.session_state.training_compare_curr_name = curr_file.name
-                    st.rerun()
-            except Exception as e:
-                _show_api_error("研修比較レポートの生成中にエラーが発生しました", e)
-
-    if st.session_state.training_compare_result:
-        st.markdown("---")
-        st.markdown(
-            f"**比較対象:** {st.session_state.training_compare_prev_name} → "
-            f"{st.session_state.training_compare_curr_name}"
-        )
-        st.markdown(st.session_state.training_compare_result)
-        st.download_button(
-            "📥 比較レポートを Markdown でダウンロード",
-            data=st.session_state.training_compare_result.encode("utf-8"),
-            file_name="training_comparison_report.md",
-            mime="text/markdown",
-            key="training_compare_dl",
-        )
-        if st.button("🗑️ 比較結果をクリア", key="training_compare_clear"):
-            st.session_state.training_compare_result = ""
-            st.session_state.training_compare_prev_name = ""
-            st.session_state.training_compare_curr_name = ""
-            st.rerun()
 
 
 def _render_about_tab() -> None:
