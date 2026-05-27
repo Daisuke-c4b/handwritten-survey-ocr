@@ -11,9 +11,9 @@ import pandas as pd
 from ocr_processor import (
     OCRProcessor,
     extract_texts_from_screenshots,
-    MODEL_NAME,
-    MODEL_LABEL,
-    MODEL_DESCRIPTION,
+    DEFAULT_MODEL_ID,
+    GEMINI_MODELS,
+    get_model_config,
     APP_VERSION,
     APP_UPDATED,
     CHANGELOG,
@@ -150,9 +150,50 @@ def _inject_global_css() -> None:
     st.markdown(_GLOBAL_CSS, unsafe_allow_html=True)
 
 
+def _get_gemini_model() -> str:
+    """現在選択中の Gemini モデル ID を返す."""
+    model_id = st.session_state.get("gemini_model", DEFAULT_MODEL_ID)
+    if model_id not in GEMINI_MODELS:
+        return DEFAULT_MODEL_ID
+    return model_id
+
+
+def _create_text_editor() -> TextEditor:
+    return TextEditor(model_name=_get_gemini_model())
+
+
+def _render_model_info_content(*, show_selector: bool = False) -> None:
+    """使用モデル情報（説明・ドキュメントリンク）を表示する."""
+    model_ids = list(GEMINI_MODELS.keys())
+
+    if show_selector:
+        selected = st.selectbox(
+            "Gemini モデル",
+            options=model_ids,
+            format_func=lambda mid: GEMINI_MODELS[mid]["label"],
+            index=model_ids.index(_get_gemini_model()),
+            key="gemini_model_select",
+        )
+        if selected != st.session_state.gemini_model:
+            st.session_state.gemini_model = selected
+            _invalidate_processor()
+        model_id = selected
+    else:
+        model_id = _get_gemini_model()
+
+    cfg = get_model_config(model_id)
+    st.markdown(f"**{cfg['label']}**  \n`{cfg['id']}`")
+    st.caption(cfg["description"])
+    st.markdown(
+        f"📖 [Gemini API モデル一覧（公式ドキュメント）]({GEMINI_MODELS_DOC_URL})"
+    )
+
+
 def _show_api_error(context: str, err: Exception) -> None:
     """Gemini API エラーをユーザー向けに表示する."""
-    api_err = err if isinstance(err, GeminiApiError) else wrap_gemini_exception(err, MODEL_NAME)
+    api_err = err if isinstance(err, GeminiApiError) else wrap_gemini_exception(
+        err, _get_gemini_model()
+    )
     st.error(f"❌ {context}")
     st.markdown(f"**{api_err}**")
     meta: list[str] = []
@@ -201,7 +242,7 @@ def has_respondent_id(text: str) -> bool:
 def _apply_matome(idx: int, pf: dict, rerun: bool = True) -> bool:
     """「質問ごとにまとめる」を pf['current_text'] に適用する."""
     try:
-        editor = TextEditor()
+        editor = _create_text_editor()
         with st.spinner("質問ごとにまとめています..."):
             result = editor.apply_editing(pf["current_text"], "matome", "")
         pf["current_text"] = result
@@ -280,6 +321,7 @@ _STATE_DEFAULTS: dict = {
     "exclude_screenshots": [],
     "extracted_screenshot_texts": [],
     "ocr_mode": "accurate",
+    "gemini_model": DEFAULT_MODEL_ID,
     "survey_analysis": "",
     "proofread_input": "",
     "proofread_result": "",
@@ -387,7 +429,10 @@ def _render_exclude_section() -> None:
                 with st.spinner("スクリーンショットからテキストを抽出中..."):
                     try:
                         img_bytes_list = [s.getvalue() for s in screenshots]
-                        extracted = extract_texts_from_screenshots(img_bytes_list)
+                        extracted = extract_texts_from_screenshots(
+                            img_bytes_list,
+                            model_name=_get_gemini_model(),
+                        )
                         st.session_state.extracted_screenshot_texts = extracted
                         _invalidate_processor()
                     except Exception as e:
@@ -582,7 +627,7 @@ def _render_proofread_section() -> None:
             st.warning("校正対象のテキストを入力してください。")
         else:
             try:
-                editor = TextEditor()
+                editor = _create_text_editor()
                 with st.spinner("テキストを校正中... しばらくお待ちください"):
                     result = editor.check_text_quality(
                         st.session_state.proofread_input
@@ -664,6 +709,7 @@ def _process_files(uploaded_files: list) -> None:
             ocr_processor = OCRProcessor(
                 exclude_texts=_collect_exclude_texts(),
                 ocr_mode=st.session_state.ocr_mode,
+                model_name=_get_gemini_model(),
             )
             st.session_state.ocr_processor = ocr_processor
         except ValueError as e:
@@ -849,7 +895,7 @@ def _render_quant_summary(idx: int, pf: dict) -> None:
             type="primary",
         ):
             try:
-                editor = TextEditor()
+                editor = _create_text_editor()
                 with st.spinner("定量サマリーを生成中..."):
                     summary = survey_analyzer.generate_quant_summary(
                         pf["current_text"],
@@ -1335,7 +1381,7 @@ def _render_auto_template_section() -> None:
             type="primary",
         ):
             try:
-                editor = TextEditor()
+                editor = _create_text_editor()
                 # 全ファイルの transcription を結合（current_text ではなく原文を優先）
                 combined = "\n\n---\n\n".join(
                     f"【{pf['filename']}】\n{pf.get('transcription', '')}"
@@ -1572,7 +1618,7 @@ def _render_edit_tab(idx: int, pf: dict) -> None:
                     st.warning("カスタムプロンプトを入力してください。")
                 else:
                     try:
-                        editor = TextEditor()
+                        editor = _create_text_editor()
                         with st.spinner("テキストを加工中..."):
                             result = editor.apply_editing(
                                 pf["current_text"], edit_mode, custom_prompt
@@ -1671,7 +1717,7 @@ def _render_download_tab(idx: int, pf: dict, doc_generator: DocumentGenerator) -
         key="analyze_btn",
     ):
         try:
-            editor = TextEditor()
+            editor = _create_text_editor()
             texts = [pf["current_text"] for pf in st.session_state.processed_files]
             filenames = [pf["filename"] for pf in st.session_state.processed_files]
             with st.spinner("アンケートを分析中... しばらくお待ちください"):
@@ -1797,10 +1843,7 @@ def _render_sidebar() -> None:
 
         st.markdown("---")
         with st.expander("ℹ️ 使用モデル情報", expanded=False):
-            st.markdown(
-                f"**{MODEL_LABEL}** &nbsp; `{MODEL_NAME}`  \n"
-                f"{MODEL_DESCRIPTION}"
-            )
+            _render_model_info_content(show_selector=True)
 
 
 def _render_upload_tab() -> None:
@@ -1862,10 +1905,9 @@ def _render_cost_tab() -> None:
 
 def _render_about_tab() -> None:
     st.subheader("ℹ️ アプリ情報")
-    st.markdown(
-        f"**{MODEL_LABEL}** &nbsp; `{MODEL_NAME}`  \n"
-        f"{MODEL_DESCRIPTION}"
-    )
+    st.markdown("### 使用モデル")
+    st.caption("モデルの変更はサイドバーの「使用モデル情報」から行えます。")
+    _render_model_info_content(show_selector=False)
     st.markdown("---")
     st.markdown("### 📋 更新履歴")
     for entry in CHANGELOG:

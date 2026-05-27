@@ -16,17 +16,55 @@ from gemini_api import (
     wrap_gemini_exception,
 )
 
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.7.3"
 APP_UPDATED = "2026-05-26"
 
-MODEL_NAME = "gemini-3.1-flash-lite"
-MODEL_LABEL = "Gemini 3.1 Flash-Lite"
-MODEL_DESCRIPTION = (
-    "Gemini 3 シリーズの安定版 Flash-Lite。"
-    "大規模モデルに匹敵するパフォーマンスを、わずかな費用で実現します。"
-)
+DEFAULT_MODEL_ID = "gemini-3.1-flash-lite"
+
+GEMINI_MODELS: dict[str, dict[str, str]] = {
+    "gemini-3.1-flash-lite": {
+        "label": "Gemini 3.1 Flash-Lite",
+        "description": (
+            "Gemini 3 シリーズの安定版 Flash-Lite。"
+            "大規模モデルに匹敵するパフォーマンスを、わずかな費用で実現します。"
+        ),
+    },
+    "gemini-3.5-flash": {
+        "label": "Gemini 3.5 Flash",
+        "description": (
+            "エージェントタスクとコーディングタスクで最先端のパフォーマンスを"
+            "維持できる、最もインテリジェントなモデル。"
+        ),
+    },
+}
+
+# 後方互換のためデフォルトモデルのエイリアスを維持
+MODEL_NAME = DEFAULT_MODEL_ID
+MODEL_LABEL = GEMINI_MODELS[DEFAULT_MODEL_ID]["label"]
+MODEL_DESCRIPTION = GEMINI_MODELS[DEFAULT_MODEL_ID]["description"]
+
+
+def get_model_config(model_id: str | None = None) -> dict[str, str]:
+    """モデル ID から表示名・説明を取得する."""
+    mid = model_id or DEFAULT_MODEL_ID
+    if mid not in GEMINI_MODELS:
+        mid = DEFAULT_MODEL_ID
+    cfg = GEMINI_MODELS[mid]
+    return {
+        "id": mid,
+        "label": cfg["label"],
+        "description": cfg["description"],
+    }
 
 CHANGELOG: list[dict] = [
+    {
+        "version": "1.7.3",
+        "date": "2026-05-26",
+        "changes": [
+            "使用モデルを選択可能に: デフォルト gemini-3.1-flash-lite / オプション gemini-3.5-flash",
+            "使用モデル情報に Gemini API 公式モデル一覧ドキュメントへのリンクを追加",
+        ],
+    },
     {
         "version": "1.7.2",
         "date": "2026-05-26",
@@ -151,12 +189,18 @@ def _get_api_key() -> str:
     return api_key
 
 
-def extract_texts_from_screenshots(image_bytes_list: list[bytes]) -> list[str]:
+def extract_texts_from_screenshots(
+    image_bytes_list: list[bytes],
+    model_name: str | None = None,
+) -> list[str]:
     """Extract printed text from screenshot images using Gemini (for exclusion)."""
     api_key = _get_api_key()
+    model = model_name or DEFAULT_MODEL_ID
+    if model not in GEMINI_MODELS:
+        model = DEFAULT_MODEL_ID
     endpoint = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{MODEL_NAME}:generateContent"
+        f"{model}:generateContent"
     )
     prompt = (
         "この画像に含まれる**印刷された文字**をすべて読み取り、"
@@ -180,7 +224,7 @@ def extract_texts_from_screenshots(image_bytes_list: list[bytes]) -> list[str]:
             }
             with TimedCall(
                 purpose="除外テキスト抽出",
-                model=MODEL_NAME,
+                model=model,
                 input_chars=len(prompt),
                 image_bytes=len(img_bytes),
             ) as tc:
@@ -191,12 +235,12 @@ def extract_texts_from_screenshots(image_bytes_list: list[bytes]) -> list[str]:
                         json=payload,
                         timeout=60,
                     )
-                    raise_for_gemini_response(res, MODEL_NAME)
+                    raise_for_gemini_response(res, model)
                     text = parse_generate_content_response(res.json())
                     tc.set_output(text or "")
                 except Exception as _e_cost:
                     tc.mark_error(_e_cost)
-                    raise wrap_gemini_exception(_e_cost, MODEL_NAME) from _e_cost
+                    raise wrap_gemini_exception(_e_cost, model) from _e_cost
             for line in text.strip().splitlines():
                 line = line.strip()
                 if line:
@@ -204,15 +248,22 @@ def extract_texts_from_screenshots(image_bytes_list: list[bytes]) -> list[str]:
         except GeminiApiError:
             raise
         except Exception as e:
-            raise wrap_gemini_exception(e, MODEL_NAME) from e
+            raise wrap_gemini_exception(e, model) from e
     return extracted
 
 
 class OCRProcessor:
-    def __init__(self, exclude_texts: list[str] | None = None, ocr_mode: str = "accurate"):
+    def __init__(
+        self,
+        exclude_texts: list[str] | None = None,
+        ocr_mode: str = "accurate",
+        model_name: str | None = None,
+    ):
         """Initialize Gemini AI for OCR processing"""
         self.api_key = _get_api_key()
-        self.model_name = MODEL_NAME
+        self.model_name = model_name or DEFAULT_MODEL_ID
+        if self.model_name not in GEMINI_MODELS:
+            self.model_name = DEFAULT_MODEL_ID
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         self.exclude_texts = [t.strip() for t in (exclude_texts or []) if t.strip()]
         self.ocr_mode = ocr_mode

@@ -6,7 +6,7 @@ from gemini_api import (
     raise_for_gemini_response,
     wrap_gemini_exception,
 )
-from ocr_processor import _get_api_key, MODEL_NAME
+from ocr_processor import _get_api_key, DEFAULT_MODEL_ID, get_model_config
 from cost_tracker import TimedCall
 
 EDITING_MODES: dict[str, dict] = {
@@ -182,11 +182,14 @@ _SURVEY_ANALYSIS_PROMPT = """
 
 
 class TextEditor:
-    def __init__(self):
+    def __init__(self, model_name: str | None = None):
         self.api_key = _get_api_key()
+        self.model_name = model_name or DEFAULT_MODEL_ID
+        cfg = get_model_config(self.model_name)
+        self.model_name = cfg["id"]
         self.endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{MODEL_NAME}:generateContent"
+            f"{self.model_name}:generateContent"
         )
 
     def apply_editing(self, text: str, mode: str, custom_prompt: str = "") -> str:
@@ -250,7 +253,7 @@ class TextEditor:
 
         with TimedCall(
             purpose=purpose,
-            model=MODEL_NAME,
+            model=self.model_name,
             input_chars=len(prompt),
         ) as tc:
             for attempt in range(max_retries):
@@ -261,12 +264,12 @@ class TextEditor:
                         json=payload,
                         timeout=120,
                     )
-                    raise_for_gemini_response(res, MODEL_NAME)
+                    raise_for_gemini_response(res, self.model_name)
                     text = parse_generate_content_response(res.json())
                     tc.set_output(text)
                     return text
                 except requests.HTTPError as e:
-                    last_err = wrap_gemini_exception(e, MODEL_NAME)
+                    last_err = wrap_gemini_exception(e, self.model_name)
                     status = e.response.status_code if e.response is not None else 0
                     if status >= 500 and attempt < max_retries - 1:
                         wait = 2 ** attempt
@@ -275,7 +278,7 @@ class TextEditor:
                     tc.mark_error(last_err)
                     raise last_err from e
                 except Exception as e:
-                    last_err = wrap_gemini_exception(e, MODEL_NAME)
+                    last_err = wrap_gemini_exception(e, self.model_name)
                     if attempt < max_retries - 1:
                         time.sleep(2 ** attempt)
                         continue
