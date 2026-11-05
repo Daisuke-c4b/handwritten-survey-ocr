@@ -762,13 +762,23 @@ def _process_files(uploaded_files: list) -> None:
 
             try:
                 with st.spinner(f"Gemini AI で文字起こし中: {uploaded_file.name}"):
+                    def _on_page(page_num: int, total_pages: int) -> None:
+                        status_text.text(
+                            f"文字起こし中: {uploaded_file.name}"
+                            f"（{page_num}/{total_pages} ページ）"
+                        )
+
                     if file_type == "pdf":
                         transcription, page_images = (
-                            ocr_processor.process_pdf_with_images(tmp_path)
+                            ocr_processor.process_pdf_with_images(
+                                tmp_path, on_progress=_on_page
+                            )
                         )
                     else:
                         transcription, page_images = (
-                            ocr_processor.process_image_with_images(tmp_path)
+                            ocr_processor.process_image_with_images(
+                                tmp_path, on_progress=_on_page
+                            )
                         )
 
                 if not transcription or transcription.strip() == "":

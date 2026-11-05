@@ -85,8 +85,26 @@ def wrap_gemini_exception(exc: Exception, model_name: str) -> GeminiApiError:
     )
 
 
-def parse_generate_content_response(data: dict[str, Any]) -> str:
-    """generateContent 応答 JSON からテキストを取り出す."""
+def build_generate_content_payload(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """文字起こし向けの generateContent リクエスト.
+
+    Gemini 3 系は複雑な画像で思考が長引く。抽出タスクでは thinkingLevel を
+    minimal に固定し、応答が返るまでの待ち時間を抑える。
+    """
+    return {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "thinkingConfig": {"thinkingLevel": "minimal"},
+        },
+    }
+
+
+def extract_candidate_text(data: dict[str, Any]) -> str:
+    """generateContent 応答から本文を取り出す.
+
+    Gemini 3 は parts の先頭に思考パートを置くことがある。先頭だけ読むと
+    本文が空になり、呼び出し側が失敗とみなして再試行を繰り返す。
+    """
     if "error" in data:
         err = data["error"]
         if isinstance(err, dict):
@@ -94,9 +112,28 @@ def parse_generate_content_response(data: dict[str, Any]) -> str:
         else:
             msg = str(err)
         raise GeminiApiError(f"Gemini API エラー: {msg}", api_detail=msg)
-    return (
-        data.get("candidates", [{}])[0]
-        .get("content", {})
-        .get("parts", [{}])[0]
-        .get("text", "")
-    ).strip()
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return ""
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    answers: list[str] = []
+    thoughts: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        text = (part.get("text") or "").strip()
+        if not text:
+            continue
+        if part.get("thought"):
+            thoughts.append(text)
+        else:
+            answers.append(text)
+    if answers:
+        return "\n".join(answers).strip()
+    return "\n".join(thoughts).strip()
+
+
+def parse_generate_content_response(data: dict[str, Any]) -> str:
+    """generateContent 応答 JSON からテキストを取り出す."""
+    return extract_candidate_text(data)

@@ -11,13 +11,15 @@ import numpy as np
 from cost_tracker import TimedCall
 from gemini_api import (
     GeminiApiError,
+    build_generate_content_payload,
+    extract_candidate_text,
     parse_generate_content_response,
     raise_for_gemini_response,
     wrap_gemini_exception,
 )
 
-APP_VERSION = "1.7.5"
-APP_UPDATED = "2026-11-05"
+APP_VERSION = "1.7.6"
+APP_UPDATED = "2026-11-06"
 
 DEFAULT_MODEL_ID = "gemini-3.5-flash-lite"
 
@@ -57,6 +59,15 @@ def get_model_config(model_id: str | None = None) -> dict[str, str]:
     }
 
 CHANGELOG: list[dict] = [
+    {
+        "version": "1.7.6",
+        "date": "2026-11-06",
+        "changes": [
+            "gemini-3.5-flash-lite の文字起こしが終わらない問題を修正: 思考を抑え、本文パートを正しく取得",
+            "画像の再送を最大2回に抑え、API へ送る画像を縮小して待ち時間を短縮",
+            "文字起こし中にページ番号の進捗を表示",
+        ],
+    },
     {
         "version": "1.7.5",
         "date": "2026-11-05",
@@ -226,17 +237,13 @@ def extract_texts_from_screenshots(
     extracted: list[str] = []
     for img_bytes in image_bytes_list:
         try:
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": prompt},
-                        {"inline_data": {
-                            "mime_type": "image/png",
-                            "data": base64.b64encode(img_bytes).decode("utf-8"),
-                        }},
-                    ]
-                }]
-            }
+            payload = build_generate_content_payload([
+                {"text": prompt},
+                {"inline_data": {
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(img_bytes).decode("utf-8"),
+                }},
+            ])
             with TimedCall(
                 purpose="除外テキスト抽出",
                 model=model,
@@ -446,7 +453,7 @@ class OCRProcessor:
         text, _images = self.process_pdf_with_images(pdf_path)
         return text
 
-    def process_pdf_with_images(self, pdf_path):
+    def process_pdf_with_images(self, pdf_path, on_progress=None):
         """PDF 処理を行い、文字起こしテキストと各ページの PIL 画像リストを返す.
 
         Returns:
@@ -476,7 +483,9 @@ class OCRProcessor:
             pdf_document.close()
 
             try:
-                final_text = self._process_pages_individually(all_images)
+                final_text = self._process_pages_individually(
+                    all_images, on_progress=on_progress
+                )
             except Exception as e:
                 print(f"Individual processing failed, trying batch processing: {e}")
                 final_text = self._extract_text_from_all_images(all_images)
@@ -493,7 +502,7 @@ class OCRProcessor:
         text, _images = self.process_image_with_images(image_path)
         return text
 
-    def process_image_with_images(self, image_path):
+    def process_image_with_images(self, image_path, on_progress=None):
         """単一画像の処理結果（テキスト, 画像リスト）を返す."""
         try:
             image = Image.open(image_path)
@@ -519,7 +528,9 @@ class OCRProcessor:
             original_images = [(preview, 1)]
 
             try:
-                final_text = self._process_pages_individually(all_images)
+                final_text = self._process_pages_individually(
+                    all_images, on_progress=on_progress
+                )
             except Exception as e:
                 print(f"Individual processing failed, trying batch processing: {e}")
                 final_text = self._extract_text_from_all_images(all_images)
@@ -698,6 +709,54 @@ class OCRProcessor:
             print(f"画像リサイズエラー: {e}")
             return image
     
+    def _image_bytes_for_api(self, image) -> bytes:
+        """API 送信用に長辺 2048px 以下の JPEG へ縮小する."""
+        prepared = self._ensure_max_size(image, max_dimension=2048)
+        if prepared.mode != "RGB":
+            prepared = prepared.convert("RGB")
+        buf = io.BytesIO()
+        prepared.save(buf, format="JPEG", quality=85, optimize=True)
+        data = buf.getvalue()
+        if len(data) > 4 * 1024 * 1024:
+            smaller = self._ensure_max_size(prepared, max_dimension=1600)
+            buf = io.BytesIO()
+            smaller.save(buf, format="JPEG", quality=80, optimize=True)
+            data = buf.getvalue()
+        return data
+
+    def _generate_from_image(self, prompt: str, image, purpose: str, timeout: int = 75) -> str:
+        """1枚の画像を Gemini に送り、思考パートを除いた本文を返す."""
+        img_bytes = self._image_bytes_for_api(image)
+        payload = build_generate_content_payload([
+            {"text": prompt},
+            {
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": base64.b64encode(img_bytes).decode("utf-8"),
+                }
+            },
+        ])
+        with TimedCall(
+            purpose=purpose,
+            model=self.model_name,
+            input_chars=len(prompt),
+            image_bytes=len(img_bytes),
+        ) as tc:
+            try:
+                res = requests.post(
+                    f"{self.endpoint}?key={self.api_key}",
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                    timeout=(15, timeout),
+                )
+                raise_for_gemini_response(res, self.model_name)
+                text = extract_candidate_text(res.json())
+                tc.set_output(text)
+                return text
+            except Exception as e:
+                tc.mark_error(e)
+                raise
+
     def _ensure_max_size(self, image, max_dimension=4096):
         """Ensure image doesn't exceed maximum dimension for API"""
         try:
@@ -746,140 +805,43 @@ class OCRProcessor:
         resize_on_failure=True,
         ocr_prompt: str | None = None,
     ):
-        """Extract text from image using Gemini AI with automatic resize retry on failure"""
+        """Extract text from image using Gemini AI. 失敗時は1回だけ縮小して再試行する."""
         prompt = ocr_prompt if ocr_prompt is not None else self.ocr_prompt
-        # First, ensure image doesn't exceed API limits
-        image = self._ensure_max_size(image, max_dimension=4096)
-        
-        # Try with original image first, then progressively smaller
-        scale_factors = [1.0, 0.75, 0.5, 0.35, 0.25] if resize_on_failure else [1.0]
-        
+        scale_factors = [1.0, 0.6] if resize_on_failure else [1.0]
+        last_text = ""
+
         print(f"ページ {page_num}: OCR処理開始 (元画像サイズ: {image.size})")
-        
+
         for scale_factor in scale_factors:
             try:
-                # Resize image if needed
                 current_image = image
                 if scale_factor < 1.0:
                     current_image = self._resize_image(image, scale_factor)
                     print(f"ページ {page_num}: 画像を{scale_factor*100:.0f}%に縮小して再試行中...")
-                
-                # Convert PIL Image to bytes
-                img_byte_arr = io.BytesIO()
-                current_image.save(img_byte_arr, format='PNG')
-                img_byte_arr = img_byte_arr.getvalue()
-                
-                # Check image size in bytes
-                img_size_mb = len(img_byte_arr) / (1024 * 1024)
-                print(f"ページ {page_num}: 画像サイズ {img_size_mb:.2f}MB, 解像度 {current_image.size}")
-                
-                # If image is too large, skip this scale and try smaller
-                if img_size_mb > 20:
-                    print(f"ページ {page_num}: 画像サイズが大きすぎます ({img_size_mb:.2f}MB)。縮小します...")
-                    continue
-                
-                # Generate content with Gemini
-                headers = {
-                    "Content-Type": "application/json"
-                }
-                payload = {
-                    "contents": [
-                        {
-                            "parts": [
-                                {"text": prompt},
-                                {
-                                    "inline_data": {
-                                        "mime_type": "image/png",
-                                        "data": base64.b64encode(img_byte_arr).decode("utf-8")
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                }
-                
+
                 print(f"ページ {page_num}: Gemini API呼び出し中...")
-                with TimedCall(
+                text = self._generate_from_image(
+                    prompt,
+                    current_image,
                     purpose=f"OCR: 個別ページ (P.{page_num})",
-                    model=self.model_name,
-                    input_chars=len(prompt),
-                    image_bytes=len(img_byte_arr),
-                ) as tc:
-                    try:
-                        res = requests.post(
-                            f"{self.endpoint}?key={self.api_key}",
-                            headers=headers,
-                            json=payload,
-                            timeout=180
-                        )
-                        print(f"ページ {page_num}: APIレスポンス status={res.status_code}")
-                        res.raise_for_status()
-                        data = res.json()
-                        _resp_text_for_cost = (
-                            data.get("candidates", [{}])[0]
-                            .get("content", {})
-                            .get("parts", [{}])[0]
-                            .get("text", "")
-                        )
-                        tc.set_output(_resp_text_for_cost)
-                    except Exception as _e_cost:
-                        tc.mark_error(_e_cost)
-                        raise
-                
-                # Debug: print response structure
-                if "error" in data:
-                    print(f"ページ {page_num}: APIエラー: {data['error']}")
-                    continue
-                
-                text = (
-                    data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                )
-                
-                if text:
-                    text = text.strip()
-                    print(f"ページ {page_num}: テキスト取得成功 ({len(text)}文字)")
-                    # Check if text is valid
-                    if self._is_text_valid(text):
-                        if scale_factor < 1.0:
-                            print(f"ページ {page_num}: 縮小画像({scale_factor*100:.0f}%)で文字読み取り成功")
-                        return text
-                    # If text is invalid and we have more scale factors to try, continue
-                    elif scale_factor != scale_factors[-1]:
-                        print(f"ページ {page_num}: テキストが無効 (短すぎるか、エラーメッセージ)。次の縮小率を試行します...")
-                        continue
-                    else:
-                        # Last attempt, return what we got
-                        return text if text else f"ページ {page_num}: テキストが検出されませんでした"
-                else:
-                    print(f"ページ {page_num}: テキストが空です")
-                    # Empty response, try next scale factor if available
-                    if scale_factor != scale_factors[-1]:
-                        continue
-                    return f"ページ {page_num}: テキストが検出されませんでした"
-                    
+                ).strip()
+                print(f"ページ {page_num}: テキスト取得 ({len(text)}文字)")
+                if self._is_text_valid(text):
+                    return text
+                last_text = text
             except Exception as e:
                 error_msg = str(e)
                 print(f"ページ {page_num}: エラー発生 - {error_msg}")
                 api_err = wrap_gemini_exception(e, self.model_name)
-                # モデル未提供・認可エラー等は即座に上位へ伝播（ユーザーに表示させる）
                 if api_err.status_code in (400, 403, 404):
                     raise api_err from e
-                # If quota exceeded, don't retry
                 if "429" in error_msg or "quota" in error_msg.lower():
                     return f"ページ {page_num}: OCRエラー - {str(e)}"
-                
-                # If this is the last attempt, return error
                 if scale_factor == scale_factors[-1]:
                     return f"ページ {page_num}: OCRエラー - {str(e)}"
-                
-                # Otherwise, try next scale factor
-                print(f"ページ {page_num}: エラー発生。次の縮小率を試行します: {str(e)}")
                 continue
-        
-        return f"ページ {page_num}: すべての試行が失敗しました"
+
+        return last_text or f"ページ {page_num}: テキストが検出されませんでした"
     
     def _extract_text_from_all_images(self, images_with_pages):
         """Extract text from multiple images with question consolidation"""
@@ -891,34 +853,25 @@ class OCRProcessor:
             
             # Add all images
             for image, page_num in images_with_pages:
-                # Convert PIL Image to bytes
-                img_byte_arr = io.BytesIO()
-                image.save(img_byte_arr, format='PNG')
-                img_byte_arr = img_byte_arr.getvalue()
-                
-                # Create Gemini compatible image
-                gemini_image = {
-                    "mime_type": "image/png",
-                    "data": img_byte_arr
-                }
-                
+                img_byte_arr = self._image_bytes_for_api(image)
                 content_parts.append(f"\n--- ページ {page_num} ---")
-                content_parts.append(gemini_image)
-            
-            # Build payload for multi-page
+                content_parts.append({
+                    "mime_type": "image/jpeg",
+                    "data": img_byte_arr,
+                })
+
             parts = []
             for part in content_parts:
                 if isinstance(part, str):
                     parts.append({"text": part})
                 else:
-                    # image dict with bytes
                     parts.append({
                         "inline_data": {
-                            "mime_type": part.get("mime_type", "image/png"),
-                            "data": base64.b64encode(part["data"]).decode("utf-8")
+                            "mime_type": part.get("mime_type", "image/jpeg"),
+                            "data": base64.b64encode(part["data"]).decode("utf-8"),
                         }
                     })
-            payload = {"contents": [{"parts": parts}]}
+            payload = build_generate_content_payload(parts)
             total_img_bytes = sum(
                 len(p.get("inline_data", {}).get("data", "")) for p in parts
                 if isinstance(p, dict) and "inline_data" in p
@@ -934,16 +887,10 @@ class OCRProcessor:
                         f"{self.endpoint}?key={self.api_key}",
                         headers={"Content-Type": "application/json"},
                         json=payload,
-                        timeout=300
+                        timeout=(15, 90)
                     )
-                    res.raise_for_status()
-                    data = res.json()
-                    text = (
-                        data.get("candidates", [{}])[0]
-                        .get("content", {})
-                        .get("parts", [{}])[0]
-                        .get("text", "")
-                    )
+                    raise_for_gemini_response(res, self.model_name)
+                    text = extract_candidate_text(res.json())
                     tc.set_output(text or "")
                 except Exception as _e_cost:
                     tc.mark_error(_e_cost)
@@ -963,13 +910,15 @@ class OCRProcessor:
             
             return "\n\n".join(all_text) if all_text else "文字起こし結果がありません。"
     
-    def _process_pages_individually(self, images_with_pages):
+    def _process_pages_individually(self, images_with_pages, on_progress=None):
         """Process each page individually with retry logic for maximum accuracy"""
         total_pages = len(images_with_pages)
         all_page_results = []
         reference_questions: dict[int, str] = {}
 
         for idx, (image, page_num) in enumerate(images_with_pages):
+            if on_progress is not None:
+                on_progress(page_num, total_pages)
             ref = reference_questions if idx > 0 and reference_questions else None
             page_text = self._extract_with_retry(
                 image,
@@ -1022,34 +971,15 @@ class OCRProcessor:
             ocr_prompt=page_prompt,
         )
         
-        # If result is valid, return it
         if self._is_text_valid(result):
             return result
-        
-        # If still invalid after resize attempts, try with enhanced prompt
-        scale_factors = [1.0, 0.8, 0.6, 0.4]
-        best_result = ""
-        
-        for scale_factor in scale_factors:
-            try:
-                # Resize image if needed
-                current_image = image
-                if scale_factor < 1.0:
-                    current_image = self._resize_image(image, scale_factor)
-                    print(f"ページ {page_num}: 拡張プロンプトで画像を{scale_factor*100:.0f}%に縮小して再試行中...")
-                
-                # Convert PIL Image to bytes with high quality
-                img_byte_arr = io.BytesIO()
-                current_image.save(img_byte_arr, format='PNG', quality=100, optimize=False)
-                img_byte_arr = img_byte_arr.getvalue()
-                
-                # Enhanced prompt for individual page processing
-                proofread_hint = (
-                    f"\n- 【校正注記】の各項目には必ず「ページ{page_num}」と"
-                    f"該当する質問番号・位置（例: ページ{page_num}・Q1回答欄1行目）を記載してください"
-                    if self.ocr_mode == "proofread" else ""
-                )
-                individual_prompt = f"""
+
+        proofread_hint = (
+            f"\n- 【校正注記】の各項目には必ず「ページ{page_num}」と"
+            f"該当する質問番号・位置（例: ページ{page_num}・Q1回答欄1行目）を記載してください"
+            if self.ocr_mode == "proofread" else ""
+        )
+        individual_prompt = f"""
 {page_prompt}
 
 **ページ {page_num} の再試行（より厳密に）：**
@@ -1059,76 +989,22 @@ class OCRProcessor:
 
 画像を慎重に分析し、印刷質問文と手書き回答を正確に文字起こししてください：
 """
-                
-                # REST call
-                payload = {
-                    "contents": [
-                        {
-                            "parts": [
-                                {"text": individual_prompt},
-                                {
-                                    "inline_data": {
-                                        "mime_type": "image/png",
-                                        "data": base64.b64encode(img_byte_arr).decode("utf-8")
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                }
-                with TimedCall(
-                    purpose=f"OCR: 拡張プロンプト (P.{page_num})",
-                    model=self.model_name,
-                    input_chars=len(individual_prompt),
-                    image_bytes=len(img_byte_arr),
-                ) as tc:
-                    try:
-                        res = requests.post(
-                            f"{self.endpoint}?key={self.api_key}",
-                            headers={"Content-Type": "application/json"},
-                            json=payload,
-                            timeout=120
-                        )
-                        res.raise_for_status()
-                        data = res.json()
-                        current_result = (
-                            data.get("candidates", [{}])[0]
-                            .get("content", {})
-                            .get("parts", [{}])[0]
-                            .get("text", "")
-                        ).strip()
-                        tc.set_output(current_result)
-                    except Exception as _e_cost:
-                        tc.mark_error(_e_cost)
-                        raise
-                
-                if current_result and self._is_text_valid(current_result):
-                    # Found valid result
-                    if scale_factor < 1.0:
-                        print(f"ページ {page_num}: 拡張プロンプトで縮小画像({scale_factor*100:.0f}%)で文字読み取り成功")
-                    return current_result
-                
-                # Keep the longest/most detailed result
-                if len(current_result) > len(best_result):
-                    best_result = current_result
-                
-            except Exception as e:
-                error_message = str(e)
-                print(f"ページ {page_num}: 拡張プロンプト試行失敗 (縮小率{scale_factor*100:.0f}%): {e}")
-                
-                # If quota exceeded, don't retry
-                if "429" in error_message or "quota" in error_message.lower():
-                    print(f"Quota exceeded for page {page_num}, skipping retries")
-                    break
-                
-                # Continue to next scale factor
-                continue
-        
-        # Return best result if valid, otherwise return error message
-        if self._is_text_valid(best_result):
-            return best_result
-        
-        return best_result if best_result else f"ページ {page_num}: 文字起こしに失敗しました"
+        try:
+            current_result = self._generate_from_image(
+                individual_prompt,
+                self._resize_image(image, 0.75),
+                purpose=f"OCR: 拡張プロンプト (P.{page_num})",
+            ).strip()
+        except Exception as e:
+            print(f"ページ {page_num}: 拡張プロンプト試行失敗: {e}")
+            api_err = wrap_gemini_exception(e, self.model_name)
+            if api_err.status_code in (400, 403, 404):
+                raise api_err from e
+            return result or f"ページ {page_num}: 文字起こしに失敗しました"
+
+        if self._is_text_valid(current_result):
+            return current_result
+        return current_result or result or f"ページ {page_num}: 文字起こしに失敗しました"
     
     def _consolidate_questions_from_pages(self, page_results):
         """Consolidate questions and answers from multiple pages.
@@ -1441,7 +1317,7 @@ Q<番号>: <該当する回答テキスト1行のみ>
         timeout: int = 120,
     ) -> str:
         """テキストのみの軽量 Gemini 呼び出し（コスト記録あり）."""
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        payload = build_generate_content_payload([{"text": prompt}])
         with TimedCall(
             purpose=purpose,
             model=self.model_name,

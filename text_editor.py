@@ -2,6 +2,7 @@ import time
 import requests
 from gemini_api import (
     GeminiApiError,
+    build_generate_content_payload,
     parse_generate_content_response,
     raise_for_gemini_response,
     wrap_gemini_exception,
@@ -248,7 +249,7 @@ class TextEditor:
 
         コスト・処理時間はモジュール cost_tracker に記録される。
         """
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        payload = build_generate_content_payload([{"text": prompt}])
         last_err: Exception = RuntimeError("API呼び出しに失敗しました")
 
         with TimedCall(
