@@ -18,24 +18,24 @@ from gemini_api import (
     wrap_gemini_exception,
 )
 
-APP_VERSION = "1.7.6"
+APP_VERSION = "1.7.7"
 APP_UPDATED = "2026-11-06"
 
-DEFAULT_MODEL_ID = "gemini-3.5-flash-lite"
+DEFAULT_MODEL_ID = "gemini-3.1-flash-lite"
 
 GEMINI_MODELS: dict[str, dict[str, str]] = {
-    "gemini-3.5-flash-lite": {
-        "label": "Gemini 3.5 Flash-Lite",
-        "description": (
-            "3.5 ファミリーで最も高速かつ低コストなモデル。"
-            "大量処理や文書解析向けに最適化されています。"
-        ),
-    },
     "gemini-3.1-flash-lite": {
         "label": "Gemini 3.1 Flash-Lite",
         "description": (
             "Gemini 3 シリーズの安定版 Flash-Lite。"
             "大規模モデルに匹敵するパフォーマンスを、わずかな費用で実現します。"
+        ),
+    },
+    "gemini-3.5-flash-lite": {
+        "label": "Gemini 3.5 Flash-Lite",
+        "description": (
+            "3.5 ファミリーで最も高速かつ低コストなモデル。"
+            "大量処理や文書解析向けに最適化されています。"
         ),
     },
 }
@@ -59,6 +59,13 @@ def get_model_config(model_id: str | None = None) -> dict[str, str]:
     }
 
 CHANGELOG: list[dict] = [
+    {
+        "version": "1.7.7",
+        "date": "2026-11-06",
+        "changes": [
+            "既定モデルを gemini-3.1-flash-lite に戻した",
+        ],
+    },
     {
         "version": "1.7.6",
         "date": "2026-11-06",
