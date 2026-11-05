@@ -16,7 +16,7 @@ from gemini_api import (
     wrap_gemini_exception,
 )
 
-APP_VERSION = "1.7.4"
+APP_VERSION = "1.7.5"
 APP_UPDATED = "2026-11-05"
 
 DEFAULT_MODEL_ID = "gemini-3.5-flash-lite"
@@ -34,13 +34,6 @@ GEMINI_MODELS: dict[str, dict[str, str]] = {
         "description": (
             "Gemini 3 シリーズの安定版 Flash-Lite。"
             "大規模モデルに匹敵するパフォーマンスを、わずかな費用で実現します。"
-        ),
-    },
-    "gemini-3.5-flash": {
-        "label": "Gemini 3.5 Flash",
-        "description": (
-            "エージェントタスクとコーディングタスクで最先端のパフォーマンスを"
-            "維持できる、最もインテリジェントなモデル。"
         ),
     },
 }
@@ -64,6 +57,13 @@ def get_model_config(model_id: str | None = None) -> dict[str, str]:
     }
 
 CHANGELOG: list[dict] = [
+    {
+        "version": "1.7.5",
+        "date": "2026-11-05",
+        "changes": [
+            "使用モデルの選択肢から Gemini 3.5 Flash を削除",
+        ],
+    },
     {
         "version": "1.7.4",
         "date": "2026-11-05",

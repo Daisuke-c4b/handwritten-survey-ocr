@@ -334,6 +334,13 @@ def _init_session_state() -> None:
     for key, default in _STATE_DEFAULTS.items():
         if key not in st.session_state:
             st.session_state[key] = default
+    if st.session_state.get("gemini_model") not in GEMINI_MODELS:
+        st.session_state.gemini_model = DEFAULT_MODEL_ID
+    if (
+        "gemini_model_select" in st.session_state
+        and st.session_state.gemini_model_select not in GEMINI_MODELS
+    ):
+        st.session_state.gemini_model_select = DEFAULT_MODEL_ID
 
 
 def _invalidate_processor() -> None:
